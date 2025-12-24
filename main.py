@@ -178,49 +178,55 @@ def plot_results(data1, data2, scale_factor):
     t1, r1, g1, b1 = data1
     t2, r2, g2, b2 = data2
     
-    # Calculate Average Curves
-    avg1 = [(r + g + b) / 3 for r, g, b in zip(r1, g1, b1)]
-    avg2 = [(r + g + b) / 3 for r, g, b in zip(r2, g2, b2)]
+    # Calculate Gradients (Derivatives) instead of simple Average
+    # We want a signal that represents "rate of change"
+    # Gradient of each channel
+    dr1 = np.gradient(r1)
+    dg1 = np.gradient(g1)
+    db1 = np.gradient(b1)
+    # Combine gradients: L2 norm of the change vector (magnitude of change)
+    grad1 = np.sqrt(dr1**2 + dg1**2 + db1**2)
     
-    # Calculate time shift given the manual scale
-    shift = find_time_shift(t1, avg1, t2, avg2, scale_factor)
+    dr2 = np.gradient(r2)
+    dg2 = np.gradient(g2)
+    db2 = np.gradient(b2)
+    grad2 = np.sqrt(dr2**2 + dg2**2 + db2**2)
+    
+    # Calculate time shift given the manual scale using GRADIENTS
+    shift = find_time_shift(t1, grad1, t2, grad2, scale_factor)
     
     print(f"Using Manual Scale Factor: {scale_factor:.4f}")
     print(f"Detected Time Shift: {shift:.4f} seconds")
     
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 15), sharex=False)
     
-    # Plot Video 1
-    ax1.plot(t1, r1, color='red', label='Red', linewidth=1)
-    ax1.plot(t1, g1, color='green', label='Green', linewidth=1)
-    ax1.plot(t1, b1, color='blue', label='Blue', linewidth=1)
-    ax1.plot(t1, avg1, color='black', label='Average', linewidth=2, linestyle='--')
-    ax1.set_ylabel('Intensity (0-1)')
-    ax1.set_title(f'Video 1 (Reference)')
+    # Plot Video 1 (Gradient)
+    ax1.plot(t1, r1, color='red', alpha=0.3, label='Red Raw') # Show raw faint
+    ax1.plot(t1, grad1, color='black', label='Gradient Magnitude', linewidth=1.5)
+    ax1.set_ylabel('Change Intensity')
+    ax1.set_title(f'Video 1 (Reference) - Gradient')
     ax1.legend(loc='upper right')
     ax1.grid(True, alpha=0.3)
     
-    # Plot Video 2
-    ax2.plot(t2, r2, color='red', label='Red', linewidth=1)
-    ax2.plot(t2, g2, color='green', label='Green', linewidth=1)
-    ax2.plot(t2, b2, color='blue', label='Blue', linewidth=1)
-    ax2.plot(t2, avg2, color='black', label='Average', linewidth=2, linestyle='--')
+    # Plot Video 2 (Gradient)
+    ax2.plot(t2, r2, color='red', alpha=0.3, label='Red Raw')
+    ax2.plot(t2, grad2, color='black', label='Gradient Magnitude', linewidth=1.5)
     ax2.set_xlabel('Original Time (seconds)')
-    ax2.set_ylabel('Intensity (0-1)')
-    ax2.set_title(f'Video 2 (Original)')
+    ax2.set_ylabel('Change Intensity')
+    ax2.set_title(f'Video 2 (Original) - Gradient')
     ax2.legend(loc='upper right')
     ax2.grid(True, alpha=0.3)
     
-    # Plot Aligned Averages
-    ax3.plot(t1, avg1, color='black', label='Video 1 Avg', linewidth=2)
+    # Plot Aligned Gradients
+    ax3.plot(t1, grad1, color='black', label='Video 1 Gradient', linewidth=2)
     
     # Apply transform to t2
     t2_aligned = np.array(t2) * scale_factor + shift
     
-    ax3.plot(t2_aligned, avg2, color='blue', label=f'Video 2 Aligned (x{scale_factor:.3f} + {shift:.2f}s)', linewidth=2, linestyle='--')
+    ax3.plot(t2_aligned, grad2, color='blue', label=f'Video 2 Gradient (x{scale_factor:.3f} + {shift:.2f}s)', linewidth=2, linestyle='--')
     ax3.set_xlabel('Time (Video 1 Timebase)')
-    ax3.set_ylabel('Average Intensity')
-    ax3.set_title('Aligned Average Curves')
+    ax3.set_ylabel('Gradient Magnitude')
+    ax3.set_title('Aligned Gradient Curves')
     ax3.legend(loc='upper right')
     ax3.grid(True, alpha=0.3)
     
