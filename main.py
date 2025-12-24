@@ -113,8 +113,54 @@ def find_time_shift(t1, y1, t2, y2, scale):
     # Find max correlation
     lag_idx = np.argmax(corr)
     lag_samples = lags[lag_idx]
-    best_shift = lag_samples / fs
+    coarse_shift = lag_samples / fs
+    
+    print(f"Coarse shift detected: {coarse_shift:.4f}s")
+
+    # Fine-tuning step: minimize MSE locally
+    # Search window: +/- 0.1 seconds around coarse shift
+    # Step size: 0.001 seconds (1ms) is standard, but let's go finer if needed
+    fine_shifts = np.linspace(coarse_shift - 0.1, coarse_shift + 0.1, 201)
+    
+    best_mse = float('inf')
+    best_shift = coarse_shift
+    
+    # Pre-calculate y1 function for fast evaluation
+    f1 = interpolate.interp1d(t1, y1, kind='linear', fill_value="extrapolate")
+    
+    # We will evaluate error on the overlapping interval
+    # t2_scaled + shift must be within [t1_min, t1_max]
+    
+    for s in fine_shifts:
+        # Time points for video 2 aligned
+        t2_shifted = t2_scaled + s
+        
+        # Find overlap
+        start_t = max(t1[0], t2_shifted[0])
+        end_t = min(t1[-1], t2_shifted[-1])
+        
+        if end_t <= start_t:
+            continue
             
+        # Evaluate on a grid in the overlap
+        t_eval = np.arange(start_t, end_t, 0.01) # 100Hz eval grid for MSE
+        if len(t_eval) < 10: continue
+        
+        # y1 values
+        v1 = f1(t_eval)
+        
+        # y2 values: need to interpolate y2 at (t_eval - s) / scale (but t2_scaled is already scaled)
+        # So we need y2 value at time t on the t2_scaled axis, which is t - s
+        f2 = interpolate.interp1d(t2_scaled, y2, kind='linear', fill_value="extrapolate")
+        v2 = f2(t_eval - s)
+        
+        mse = np.mean((v1 - v2)**2)
+        
+        if mse < best_mse:
+            best_mse = mse
+            best_shift = s
+            
+    print(f"Fine-tuned shift: {best_shift:.4f}s")
     return best_shift
 
 
