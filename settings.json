@@ -1,7 +1,10 @@
 {
-    "audio_folder": "M:/Hero 108/Stagione 1",
-    "video_folder": "M:/temp_downloads/vixsrc/Hero 108",
-    "scale_mode": 1,
+    "app_mode": "folder",
+    "output_folder": "M:/Hero 108 synced",
+    "scale_mode": 0,
+    "frame_step": 1,
     "ratio_a": 1,
-    "ratio_v": 1
+    "ratio_v": 2,
+    "audio_folder": "M:/Hero 108/Stagione 1",
+    "video_folder": "M:/temp_downloads/vixsrc/Hero 108"
 }

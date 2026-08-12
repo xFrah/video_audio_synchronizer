@@ -5,18 +5,118 @@ import json
 import av
 import numpy as np
 import matplotlib.pyplot as plt
+import subprocess
 from scipy import signal, interpolate
 from natsort import natsorted
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QProgressBar, QComboBox, 
-    QGroupBox, QFormLayout, QTextEdit, QSpinBox
+    QGroupBox, QFormLayout, QTextEdit, QSpinBox, QRadioButton, QButtonGroup,
+    QSlider, QToolTip
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
+from PyQt6.QtGui import QCursor, QImage, QPixmap
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+
+
+def format_time(seconds):
+    if seconds is None or seconds < 0:
+        return "00:00:00.000"
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    ms = int((seconds - int(seconds)) * 1000)
+    return f"{int(h):02d}:{int(m):02d}:{int(s):02d}.{ms:03d}"
+
+
+def get_thumbnail(thumbnails, target_time):
+    if not thumbnails:
+        return None
+    times = [item[0] for item in thumbnails]
+    idx = np.searchsorted(times, target_time)
+    idx = np.clip(idx, 0, len(thumbnails) - 1)
+    
+    _, img_bytes, w, h = thumbnails[idx]
+    qimg = QImage(img_bytes, w, h, w * 3, QImage.Format.Format_RGB888)
+    return QPixmap.fromImage(qimg)
+
+
+class FramePreviewPopup(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #202124;
+                border: 1px solid #5f6368;
+                border-radius: 6px;
+                color: white;
+                font-family: sans-serif;
+            }
+            QLabel {
+                border: none;
+            }
+        """)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        
+        self.lbl_header = QLabel("")
+        self.lbl_header.setStyleSheet("font-weight: bold; color: #e8eaed; font-size: 11px;")
+        self.lbl_header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.lbl_header)
+        
+        imgs_layout = QHBoxLayout()
+        imgs_layout.setSpacing(8)
+        
+        # Audio Source Container
+        box_audio = QVBoxLayout()
+        lbl_a_title = QLabel("🎵 Audio Source Frame")
+        lbl_a_title.setStyleSheet("color: #8ab4f8; font-size: 10px; font-weight: bold;")
+        lbl_a_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_img_audio = QLabel()
+        self.lbl_img_audio.setFixedSize(200, 112)
+        self.lbl_img_audio.setStyleSheet("background-color: #000; border: 1px solid #3c4043;")
+        self.lbl_img_audio.setScaledContents(True)
+        box_audio.addWidget(lbl_a_title)
+        box_audio.addWidget(self.lbl_img_audio)
+        
+        # Video Source Container
+        box_video = QVBoxLayout()
+        lbl_v_title = QLabel("🎬 Video Source Frame")
+        lbl_v_title.setStyleSheet("color: #81c995; font-size: 10px; font-weight: bold;")
+        lbl_v_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_img_video = QLabel()
+        self.lbl_img_video.setFixedSize(200, 112)
+        self.lbl_img_video.setStyleSheet("background-color: #000; border: 1px solid #3c4043;")
+        self.lbl_img_video.setScaledContents(True)
+        box_video.addWidget(lbl_v_title)
+        box_video.addWidget(self.lbl_img_video)
+        
+        imgs_layout.addLayout(box_audio)
+        imgs_layout.addLayout(box_video)
+        layout.addLayout(imgs_layout)
+        
+        self.lbl_footer = QLabel("")
+        self.lbl_footer.setStyleSheet("color: #9aa0a6; font-size: 10px;")
+        self.lbl_footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.lbl_footer)
+
+    def update_preview(self, header_text, pix_audio, pix_video, footer_text):
+        self.lbl_header.setText(header_text)
+        self.lbl_footer.setText(footer_text)
+        if pix_audio and not pix_audio.isNull():
+            self.lbl_img_audio.setPixmap(pix_audio)
+        else:
+            self.lbl_img_audio.clear()
+            
+        if pix_video and not pix_video.isNull():
+            self.lbl_img_video.setPixmap(pix_video)
+        else:
+            self.lbl_img_video.clear()
+        self.adjustSize()
 
 
 def get_color_percentages(image):
@@ -25,7 +125,14 @@ def get_color_percentages(image):
     b_sum = np.sum(image[:, :, 0])
     g_sum = np.sum(image[:, :, 1])
     r_sum = np.sum(image[:, :, 2])
-    return r_sum / max_intensity, g_sum / max_intensity, b_sum / max_intensity
+    r = r_sum / max_intensity
+    g = g_sum / max_intensity
+    b = b_sum / max_intensity
+    
+    # Smooth Chromatic Balance (0.0 = Cool/Blue, 0.5 = Neutral, 1.0 = Warm/Red)
+    total = r + g + b + 1e-6
+    color_dir = ((r / total) - (b / total) + 1.0) / 2.0
+    return r, g, b, color_dir
 
 
 def find_time_shift(t1, y1, t2, y2, scale, log_callback=None):
@@ -92,6 +199,38 @@ def find_time_shift(t1, y1, t2, y2, scale, log_callback=None):
         print(msg)
     return best_shift
 
+    return best_shift
+
+
+class FFmpegWorker(QThread):
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool, str)
+
+    def __init__(self, cmd):
+        super().__init__()
+        self.cmd = cmd
+
+    def run(self):
+        try:
+            process = subprocess.Popen(
+                self.cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            )
+            for line in process.stdout:
+                self.log_signal.emit(line.strip())
+            
+            process.wait()
+            if process.returncode == 0:
+                self.finished_signal.emit(True, "Muxing complete.")
+            else:
+                self.finished_signal.emit(False, f"ffmpeg exited with code {process.returncode}")
+        except Exception as e:
+            self.finished_signal.emit(False, str(e))
+
 
 class AnalysisWorker(QThread):
     progress_signal = pyqtSignal(int, int, str)
@@ -99,12 +238,13 @@ class AnalysisWorker(QThread):
     finished_signal = pyqtSignal(object, object, float, float, int)
     error_signal = pyqtSignal(str)
 
-    def __init__(self, file1, file2, scale_factor, mode, max_frames=1000):
+    def __init__(self, file1, file2, scale_factor, mode, frame_step=1, max_frames=float('inf')):
         super().__init__()
         self.file1 = file1
         self.file2 = file2
         self.scale_factor = scale_factor
         self.mode = mode
+        self.frame_step = max(1, frame_step)
         self.max_frames = max_frames
         self._is_cancelled = False
 
@@ -113,19 +253,37 @@ class AnalysisWorker(QThread):
         try:
             container = av.open(video_path)
             stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
             
             timestamps = []
             reds = []
             greens = []
             blues = []
+            hues = []
+            thumbnails = []
 
             total_frames = stream.frames
-            if total_frames == 0 or total_frames is None:
-                total_frames = self.max_frames
-                
-            total_to_process = min(total_frames, self.max_frames)
+            if not total_frames or total_frames == 0:
+                try:
+                    dur = 0
+                    if stream.duration and stream.time_base:
+                        dur = float(stream.duration * stream.time_base)
+                    elif container.duration:
+                        dur = container.duration / 1000000.0
+                    
+                    rate = stream.average_rate or stream.r_frame_rate
+                    if dur > 0 and rate:
+                        total_frames = int(dur * float(rate))
+                except Exception:
+                    total_frames = 0
+
+            if not total_frames or total_frames == 0:
+                total_to_process = 0
+            else:
+                total_to_process = min(total_frames, self.max_frames)
             
             frame_number = 0
+            processed_count = 0
             for frame in container.decode(stream):
                 if self._is_cancelled:
                     break
@@ -133,19 +291,26 @@ class AnalysisWorker(QThread):
                     break
                 frame_number += 1
                 
-                image = frame.to_ndarray(format="bgr24")
-                r, g, b = get_color_percentages(image)
+                if (frame_number - 1) % self.frame_step != 0:
+                    continue
+                
+                small_frame = frame.reformat(width=200, height=112, format="rgb24")
+                image = small_frame.to_ndarray()
+                r, g, b, h = get_color_percentages(image)
                 
                 timestamps.append(frame.time)
                 reds.append(r)
                 greens.append(g)
                 blues.append(b)
+                hues.append(h)
+                thumbnails.append((frame.time, bytes(image), 200, 112))
+                processed_count += 1
                 
-                if frame_number % 10 == 0:
+                if processed_count % 5 == 0 or frame_number == 1:
                     self.progress_signal.emit(frame_number, total_to_process, f"Analyzing {label}...")
                     
             container.close()
-            return timestamps, reds, greens, blues
+            return timestamps, reds, greens, blues, hues, thumbnails
         except Exception as e:
             self.error_signal.emit(f"Error analyzing {video_path}: {str(e)}")
             return None
@@ -160,18 +325,11 @@ class AnalysisWorker(QThread):
         self.log_signal.emit("Calculating time shift...")
         self.progress_signal.emit(0, 0, "Calculating shift...")
         
-        t1, r1, g1, b1 = data1
-        t2, r2, g2, b2 = data2
+        t1, r1, g1, b1, h1 = data1[:5]
+        t2, r2, g2, b2, h2 = data2[:5]
         
-        dr1 = np.gradient(r1)
-        dg1 = np.gradient(g1)
-        db1 = np.gradient(b1)
-        grad1 = np.sqrt(dr1**2 + dg1**2 + db1**2)
-        
-        dr2 = np.gradient(r2)
-        dg2 = np.gradient(g2)
-        db2 = np.gradient(b2)
-        grad2 = np.sqrt(dr2**2 + dg2**2 + db2**2)
+        grad1 = np.array(h1)
+        grad2 = np.array(h2)
         
         if self.mode == 0:
             shift = find_time_shift(t1, grad1, t2, grad2, self.scale_factor, log_callback=lambda m: self.log_signal.emit(m))
@@ -193,6 +351,7 @@ class VideoAudioSyncApp(QMainWindow):
         
         self.audio_folder_path = None
         self.video_folder_path = None
+        self.output_folder_path = None
         
         self.audio_files = []
         self.video_files = []
@@ -201,6 +360,19 @@ class VideoAudioSyncApp(QMainWindow):
         self.audio_fps = None
         self.video_fps = None
         self.worker = None
+        self.ffmpeg_worker = None
+        self.last_shift = None
+        self.last_scale = None
+        self.last_mode = None
+        self.last_t_common = None
+        self.last_diff = None
+        self.baseline_diff = 0.0
+        self.std_diff = 0.0
+        self.diff_collection = None
+        self.audio_thumbnails = []
+        self.video_thumbnails = []
+        
+        self.app_mode = "folder"
         self.settings_file = "settings.json"
         
         self.ratio_timer = QTimer()
@@ -208,6 +380,7 @@ class VideoAudioSyncApp(QMainWindow):
         self.ratio_timer.timeout.connect(self.apply_ratio_change)
         
         self.init_ui()
+        self.preview_popup = FramePreviewPopup(self)
         self.load_settings()
         
     def init_ui(self):
@@ -219,13 +392,37 @@ class VideoAudioSyncApp(QMainWindow):
         files_group = QGroupBox("Source Selection")
         files_layout = QVBoxLayout()
         
-        # Audio Folder
+        # Mode Toggle
+        mode_layout = QHBoxLayout()
+        self.btn_group_mode = QButtonGroup(self)
+        
+        self.radio_folder = QRadioButton("Folder Mode")
+        self.radio_folder.setChecked(True)
+        self.radio_file = QRadioButton("Single File Mode")
+        
+        self.btn_group_mode.addButton(self.radio_folder, 0)
+        self.btn_group_mode.addButton(self.radio_file, 1)
+        
+        mode_layout.addWidget(self.radio_folder)
+        mode_layout.addWidget(self.radio_file)
+        mode_layout.addStretch()
+        
+        self.radio_folder.toggled.connect(self.on_mode_toggled)
+        files_layout.addLayout(mode_layout)
+        
+        # Audio Folder and Output Folder
         h1 = QHBoxLayout()
         self.btn_audio = QPushButton("Select Audio Folder")
         self.btn_audio.clicked.connect(lambda: self.select_folder(1))
         self.lbl_audio = QLabel("No folder selected")
         h1.addWidget(self.btn_audio)
         h1.addWidget(self.lbl_audio, stretch=1)
+        
+        self.btn_output = QPushButton("Select Output Folder")
+        self.btn_output.clicked.connect(lambda: self.select_folder(3))
+        self.lbl_output = QLabel("No folder selected")
+        h1.addWidget(self.btn_output)
+        h1.addWidget(self.lbl_output, stretch=1)
         
         self.info_audio = QLabel("")
         self.info_audio.setStyleSheet("color: gray;")
@@ -249,7 +446,7 @@ class VideoAudioSyncApp(QMainWindow):
         main_layout.addWidget(files_group)
         
         # Mapping Settings
-        mapping_group = QGroupBox("Mapping Settings")
+        self.mapping_group = QGroupBox("Mapping Settings")
         mapping_layout = QVBoxLayout()
         
         ratio_layout = QHBoxLayout()
@@ -276,8 +473,8 @@ class VideoAudioSyncApp(QMainWindow):
         lbl_mapping_desc.setWordWrap(True)
         mapping_layout.addWidget(lbl_mapping_desc)
         
-        mapping_group.setLayout(mapping_layout)
-        main_layout.addWidget(mapping_group)
+        self.mapping_group.setLayout(mapping_layout)
+        main_layout.addWidget(self.mapping_group)
         
         # Current Pair Details
         pair_group = QGroupBox("Current Pair Details")
@@ -320,23 +517,33 @@ class VideoAudioSyncApp(QMainWindow):
         main_layout.addWidget(pair_group)
         
         # Settings
-        settings_group = QGroupBox("Scaling Settings")
+        settings_group = QGroupBox("Analysis & Scaling Settings")
         settings_layout = QFormLayout()
+        
+        self.spin_frame_step = QSpinBox()
+        self.spin_frame_step.setRange(1, 100)
+        self.spin_frame_step.setValue(1)
+        self.spin_frame_step.valueChanged.connect(lambda: self.save_settings())
         
         self.combo_scale = QComboBox()
         self.combo_scale.addItems(["Scale Video to match Audio", "Scale Audio to match Video"])
         self.combo_scale.setEnabled(False)
         self.combo_scale.currentIndexChanged.connect(lambda: self.save_settings())
         
+        settings_layout.addRow("Frame Sampling (1 in N frames):", self.spin_frame_step)
         settings_layout.addRow("Scaling Mode:", self.combo_scale)
         settings_group.setLayout(settings_layout)
         main_layout.addWidget(settings_group)
         
         # Controls and Progress
         controls_layout = QHBoxLayout()
-        self.btn_analyze = QPushButton("Analyze && Sync")
+        self.btn_analyze = QPushButton("Analyze")
         self.btn_analyze.clicked.connect(self.start_analysis)
         self.btn_analyze.setEnabled(False)
+        
+        self.btn_sync_save = QPushButton("Sync and Save")
+        self.btn_sync_save.clicked.connect(self.start_sync_save)
+        self.btn_sync_save.setEnabled(False)
         
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
@@ -344,9 +551,24 @@ class VideoAudioSyncApp(QMainWindow):
         self.lbl_status = QLabel("Ready")
         
         controls_layout.addWidget(self.btn_analyze)
+        controls_layout.addWidget(self.btn_sync_save)
         controls_layout.addWidget(self.progress_bar, stretch=1)
         controls_layout.addWidget(self.lbl_status)
         main_layout.addLayout(controls_layout)
+        
+        # Diff Threshold
+        diff_layout = QHBoxLayout()
+        diff_layout.addWidget(QLabel("Color Tint Difference Threshold:"))
+        self.slider_diff = QSlider(Qt.Orientation.Horizontal)
+        self.slider_diff.setMinimum(0)
+        self.slider_diff.setMaximum(100)
+        self.slider_diff.setValue(20)
+        self.slider_diff.setEnabled(False)
+        self.slider_diff.valueChanged.connect(self.update_diff_plot)
+        self.lbl_diff_val = QLabel("1.0σ")
+        diff_layout.addWidget(self.slider_diff, stretch=1)
+        diff_layout.addWidget(self.lbl_diff_val)
+        main_layout.addLayout(diff_layout)
         
         # Logs
         self.log_text = QTextEdit()
@@ -359,6 +581,7 @@ class VideoAudioSyncApp(QMainWindow):
         self.figure.patch.set_facecolor('#202124')
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setStyleSheet("background-color: transparent;")
+        self.canvas.mpl_connect("motion_notify_event", self.on_canvas_hover)
         main_layout.addWidget(self.canvas, stretch=1)
         
     def log(self, msg):
@@ -366,6 +589,51 @@ class VideoAudioSyncApp(QMainWindow):
         # Scroll to bottom
         scrollbar = self.log_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+    def on_mode_toggled(self):
+        new_mode = "folder" if self.radio_folder.isChecked() else "file"
+        if new_mode == self.app_mode:
+            return
+            
+        self.app_mode = new_mode
+        
+        self.audio_folder_path = None
+        self.video_folder_path = None
+        self.audio_files = []
+        self.video_files = []
+        self.current_index = 0
+        self.audio_fps = None
+        self.video_fps = None
+        self.last_shift = None
+        self.last_scale = None
+        self.last_mode = None
+        self.btn_sync_save.setEnabled(False)
+        self.btn_analyze.setEnabled(False)
+        self.figure.clear()
+        self.canvas.draw()
+        self.log_text.clear()
+        self.progress_bar.setValue(0)
+        self.lbl_status.setText("Ready")
+        
+        if self.app_mode == "folder":
+            self.btn_audio.setText("Select Audio Folder")
+            self.btn_video.setText("Select Video Folder")
+            self.mapping_group.setEnabled(True)
+            self.btn_prev.setVisible(True)
+            self.btn_next.setVisible(True)
+            self.lbl_nav.setVisible(True)
+        else:
+            self.btn_audio.setText("Select Audio File")
+            self.btn_video.setText("Select Video File")
+            self.mapping_group.setEnabled(False)
+            self.btn_prev.setVisible(False)
+            self.btn_next.setVisible(False)
+            self.lbl_nav.setVisible(False)
+            
+        self.set_folder_info(True)
+        self.set_folder_info(False)
+        self.load_current_pair()
+        self.save_settings()
 
     def on_ratio_changed(self):
         self.ratio_timer.start(2000)
@@ -382,13 +650,16 @@ class VideoAudioSyncApp(QMainWindow):
         if count > 0:
             res = self.extract_resolution(files[0])
             
-        info_text = f"{count} valid files found | Resolution: {res} (from first file)"
+        file_word = "file" if self.app_mode == "file" else "files"
+        info_text = f"{count} valid {file_word} found | Resolution: {res} (from first file)"
+        
+        no_text = "No file selected" if self.app_mode == "file" else "No folder selected"
         
         if is_audio:
-            self.lbl_audio.setText(self.audio_folder_path if self.audio_folder_path else "No folder selected")
+            self.lbl_audio.setText(self.audio_folder_path if self.audio_folder_path else no_text)
             self.info_audio.setText(info_text)
         else:
-            self.lbl_video.setText(self.video_folder_path if self.video_folder_path else "No folder selected")
+            self.lbl_video.setText(self.video_folder_path if self.video_folder_path else no_text)
             self.info_video.setText(info_text)
         
     def load_settings(self):
@@ -397,20 +668,54 @@ class VideoAudioSyncApp(QMainWindow):
                 with open(self.settings_file, "r") as f:
                     settings = json.load(f)
                     
-                audio_folder = settings.get("audio_folder")
-                if audio_folder and os.path.isdir(audio_folder):
-                    self.audio_folder_path = audio_folder
-                    self.audio_files = self.get_media_files(audio_folder)
-                    self.set_folder_info(True)
+                self.app_mode = settings.get("app_mode", "folder")
+                
+                self.radio_folder.blockSignals(True)
+                self.radio_file.blockSignals(True)
+                if self.app_mode == "file":
+                    self.radio_file.setChecked(True)
+                else:
+                    self.radio_folder.setChecked(True)
+                self.radio_folder.blockSignals(False)
+                self.radio_file.blockSignals(False)
                     
-                video_folder = settings.get("video_folder")
-                if video_folder and os.path.isdir(video_folder):
-                    self.video_folder_path = video_folder
-                    self.video_files = self.get_media_files(video_folder)
-                    self.set_folder_info(False)
+                if self.app_mode == "folder":
+                    audio_folder = settings.get("audio_folder")
+                    if audio_folder and os.path.isdir(audio_folder):
+                        self.audio_folder_path = audio_folder
+                        self.audio_files = self.get_media_files(audio_folder)
+                        self.set_folder_info(True)
+                        
+                    video_folder = settings.get("video_folder")
+                    if video_folder and os.path.isdir(video_folder):
+                        self.video_folder_path = video_folder
+                        self.video_files = self.get_media_files(video_folder)
+                        self.set_folder_info(False)
+                else:
+                    audio_file = settings.get("audio_file")
+                    if audio_file and os.path.isfile(audio_file):
+                        self.audio_folder_path = audio_file
+                        self.audio_files = [audio_file]
+                        self.set_folder_info(True)
+                        
+                    video_file = settings.get("video_file")
+                    if video_file and os.path.isfile(video_file):
+                        self.video_folder_path = video_file
+                        self.video_files = [video_file]
+                        self.set_folder_info(False)
+                        
+                output_folder = settings.get("output_folder")
+                if output_folder and os.path.isdir(output_folder):
+                    self.output_folder_path = output_folder
+                    self.lbl_output.setText(output_folder)
                     
                 scale_mode = settings.get("scale_mode", 0)
                 self.combo_scale.setCurrentIndex(scale_mode)
+                
+                frame_step = settings.get("frame_step", 1)
+                self.spin_frame_step.blockSignals(True)
+                self.spin_frame_step.setValue(frame_step)
+                self.spin_frame_step.blockSignals(False)
                 
                 ratio_a = settings.get("ratio_a", 1)
                 ratio_v = settings.get("ratio_v", 1)
@@ -428,12 +733,20 @@ class VideoAudioSyncApp(QMainWindow):
 
     def save_settings(self):
         settings = {
-            "audio_folder": self.audio_folder_path,
-            "video_folder": self.video_folder_path,
+            "app_mode": self.app_mode,
+            "output_folder": self.output_folder_path,
             "scale_mode": self.combo_scale.currentIndex(),
+            "frame_step": self.spin_frame_step.value(),
             "ratio_a": self.spin_ratio_a.value(),
             "ratio_v": self.spin_ratio_v.value()
         }
+        if self.app_mode == "folder":
+            settings["audio_folder"] = self.audio_folder_path
+            settings["video_folder"] = self.video_folder_path
+        else:
+            settings["audio_file"] = self.audio_folder_path
+            settings["video_file"] = self.video_folder_path
+            
         try:
             with open(self.settings_file, "w") as f:
                 json.dump(settings, f, indent=4)
@@ -472,20 +785,34 @@ class VideoAudioSyncApp(QMainWindow):
         return natsorted(files)
 
     def select_folder(self, folder_num):
-        title = "Select Audio Folder" if folder_num == 1 else "Select Video Folder"
-        folder_path = QFileDialog.getExistingDirectory(self, title, "")
+        if folder_num == 1:
+            title = "Select Audio File" if self.app_mode == "file" else "Select Audio Folder"
+        elif folder_num == 2:
+            title = "Select Video File" if self.app_mode == "file" else "Select Video Folder"
+        else:
+            title = "Select Output Folder"
+            
+        if self.app_mode == "file" and folder_num in (1, 2):
+            folder_path, _ = QFileDialog.getOpenFileName(self, title, "", "Video/Audio Files (*.mp4 *.avi *.mkv *.mov)")
+        else:
+            folder_path = QFileDialog.getExistingDirectory(self, title, "")
+            
         if folder_path:
             if folder_num == 1:
                 self.audio_folder_path = folder_path
-                self.audio_files = self.get_media_files(folder_path)
+                self.audio_files = [folder_path] if self.app_mode == "file" else self.get_media_files(folder_path)
                 self.set_folder_info(True)
-            else:
+            elif folder_num == 2:
                 self.video_folder_path = folder_path
-                self.video_files = self.get_media_files(folder_path)
+                self.video_files = [folder_path] if self.app_mode == "file" else self.get_media_files(folder_path)
                 self.set_folder_info(False)
+            elif folder_num == 3:
+                self.output_folder_path = folder_path
+                self.lbl_output.setText(folder_path)
                 
-            self.current_index = 0
-            self.load_current_pair()
+            if folder_num in (1, 2):
+                self.current_index = 0
+                self.load_current_pair()
             self.save_settings()
 
     def get_current_indices(self):
@@ -572,6 +899,10 @@ class VideoAudioSyncApp(QMainWindow):
         self.figure.clear()
         self.canvas.draw()
         
+        self.progress_bar.setValue(0)
+        self.progress_bar.setMaximum(100)
+        self.lbl_status.setText("Starting analysis...")
+        
         if self.audio_fps and self.video_fps:
             if abs(self.audio_fps - self.video_fps) < 0.01:
                 scale_factor = 1.0
@@ -588,7 +919,10 @@ class VideoAudioSyncApp(QMainWindow):
             
         self.log(f"Using scale factor: {scale_factor:.5f}")
         
-        self.worker = AnalysisWorker(audio_file, video_file, scale_factor, mode)
+        frame_step = self.spin_frame_step.value()
+        self.log(f"Frame sampling rate: 1 in {frame_step} frames")
+        
+        self.worker = AnalysisWorker(audio_file, video_file, scale_factor, mode, frame_step=frame_step)
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.log_signal.connect(self.log)
         self.worker.finished_signal.connect(self.on_analysis_finished)
@@ -618,62 +952,43 @@ class VideoAudioSyncApp(QMainWindow):
         self.lbl_status.setText("Finished")
         self.btn_analyze.setEnabled(True)
         
+        self.last_shift = shift
+        self.last_scale = scale_factor
+        self.last_mode = mode
+        self.audio_thumbnails = data1[5]
+        self.video_thumbnails = data2[5]
+        self.btn_sync_save.setEnabled(True)
+        
         self.plot_results(data1, data2, scale_factor, shift, mode)
         
     def plot_results(self, data1, data2, scale_factor, shift, mode):
         self.figure.clear()
         
-        t1, r1, g1, b1 = data1
-        t2, r2, g2, b2 = data2
+        t1, r1, g1, b1, h1 = data1[:5]
+        t2, r2, g2, b2, h2 = data2[:5]
         
-        dr1 = np.gradient(r1)
-        dg1 = np.gradient(g1)
-        db1 = np.gradient(b1)
-        grad1 = np.sqrt(dr1**2 + dg1**2 + db1**2)
+        grad1 = np.array(h1)
+        grad2 = np.array(h2)
         
-        dr2 = np.gradient(r2)
-        dg2 = np.gradient(g2)
-        db2 = np.gradient(b2)
-        grad2 = np.sqrt(dr2**2 + dg2**2 + db2**2)
+        ax3 = self.figure.add_subplot(111)
         
-        ax1 = self.figure.add_subplot(311)
-        ax2 = self.figure.add_subplot(312)
-        ax3 = self.figure.add_subplot(313)
+        ax3.set_facecolor('#303134')
+        ax3.tick_params(colors='white')
+        ax3.xaxis.label.set_color('white')
+        ax3.yaxis.label.set_color('white')
+        ax3.title.set_color('white')
+        for spine in ax3.spines.values():
+            spine.set_edgecolor('gray')
         
-        for ax in (ax1, ax2, ax3):
-            ax.set_facecolor('#303134')
-            ax.tick_params(colors='white')
-            ax.xaxis.label.set_color('white')
-            ax.yaxis.label.set_color('white')
-            ax.title.set_color('white')
-            for spine in ax.spines.values():
-                spine.set_edgecolor('gray')
-        
-        # Plot Video 1 (Gradient)
-        ax1.plot(t1, r1, color='red', alpha=0.3, label='Red Raw')
-        ax1.plot(t1, grad1, color='white', label='Gradient Magnitude', linewidth=1.5)
-        ax1.set_ylabel('Change Intensity')
-        ax1.set_title(f'Audio Source - Gradient')
-        ax1.legend(loc='upper right')
-        ax1.grid(True, alpha=0.3)
-        
-        # Plot Video 2 (Gradient)
-        ax2.plot(t2, r2, color='red', alpha=0.3, label='Red Raw')
-        ax2.plot(t2, grad2, color='white', label='Gradient Magnitude', linewidth=1.5)
-        ax2.set_ylabel('Change Intensity')
-        ax2.set_title(f'Video Source - Gradient')
-        ax2.legend(loc='upper right')
-        ax2.grid(True, alpha=0.3)
-        
-        # Plot Aligned Gradients
+        # Plot Aligned Color Balance
         if mode == 0:
-            ax3.plot(t1, grad1, color='white', label='Audio Source Gradient', linewidth=2)
+            ax3.plot(t1, grad1, color='white', label='Audio Source Color Tint', linewidth=2)
             t_aligned = np.array(t2) * scale_factor + shift
             ax3.plot(t_aligned, grad2, color='cyan', label=f'Video Source (x{scale_factor:.3f} + {shift:.2f}s)', linewidth=2, linestyle='--')
             ax3.set_xlabel('Time (Audio Source Timebase)')
             t_ref = t1
         else:
-            ax3.plot(t2, grad2, color='white', label='Video Source Gradient', linewidth=2)
+            ax3.plot(t2, grad2, color='white', label='Video Source Color Tint', linewidth=2)
             t_aligned = np.array(t1) * scale_factor + shift
             ax3.plot(t_aligned, grad1, color='cyan', label=f'Audio Source (x{scale_factor:.3f} + {shift:.2f}s)', linewidth=2, linestyle='--')
             ax3.set_xlabel('Time (Video Source Timebase)')
@@ -691,13 +1006,203 @@ class VideoAudioSyncApp(QMainWindow):
         if overlap_end < overall_end:
             ax3.axvspan(overlap_end, overall_end, color='red', alpha=0.3, label='' if has_cut_label else 'Cut Content')
             
-        ax3.set_ylabel('Gradient Magnitude')
-        ax3.set_title('Aligned Gradient Curves')
-        ax3.legend(loc='upper right')
+        ax3.set_ylabel('Color Tint (Cool ↔ Warm)')
+        ax3.set_title('Aligned Color Balance Curves')
+        ax3.legend(loc='center left', bbox_to_anchor=(1.02, 0.5))
         ax3.grid(True, alpha=0.3)
         
+        # Calculate overlap region for diff
+        if overlap_start < overlap_end:
+            self.last_t_common = np.linspace(overlap_start, overlap_end, 1000)
+            if mode == 0:
+                interp_ref = interpolate.interp1d(t1, grad1, bounds_error=False, fill_value=0)
+                interp_align = interpolate.interp1d(t_aligned, grad2, bounds_error=False, fill_value=0)
+            else:
+                interp_ref = interpolate.interp1d(t2, grad2, bounds_error=False, fill_value=0)
+                interp_align = interpolate.interp1d(t_aligned, grad1, bounds_error=False, fill_value=0)
+                
+            ref_vals = interp_ref(self.last_t_common)
+            align_vals = interp_align(self.last_t_common)
+            self.last_diff = np.abs(ref_vals - align_vals)
+            
+            p5 = np.percentile(self.last_diff, 5)
+            best_5_pct = self.last_diff[self.last_diff <= p5]
+            if len(best_5_pct) > 0:
+                self.baseline_diff = float(np.mean(best_5_pct))
+            else:
+                self.baseline_diff = float(np.min(self.last_diff))
+                
+            self.std_diff = float(np.std(self.last_diff))
+            
+            self.slider_diff.setEnabled(True)
+        else:
+            self.slider_diff.setEnabled(False)
+            self.last_t_common = None
+            self.last_diff = None
+            self.baseline_diff = 0.0
+            self.std_diff = 0.0
+            
+        global_min = min(t1[0], t2[0], t_aligned[0])
+        global_max = max(t1[-1], t2[-1], t_aligned[-1])
+        x_limit = global_max
+        
+        ax3.set_xlim(global_min, x_limit)
+            
         self.figure.tight_layout()
         self.canvas.draw()
+        
+        if self.slider_diff.isEnabled():
+            self.update_diff_plot()
+
+    def update_diff_plot(self):
+        sigma_multiplier = self.slider_diff.value() / 20.0
+        threshold = self.baseline_diff + (sigma_multiplier * self.std_diff)
+        self.lbl_diff_val.setText(f"{sigma_multiplier:.1f}σ (Thresh: {threshold:.2f})")
+        
+        if self.last_diff is not None and self.last_t_common is not None:
+            if len(self.figure.axes) >= 1:
+                ax3 = self.figure.axes[0]
+                
+                if self.diff_collection is not None:
+                    try:
+                        self.diff_collection.remove()
+                    except ValueError:
+                        pass
+                        
+                self.diff_collection = ax3.fill_between(
+                    self.last_t_common, 0, 1,
+                    where=(self.last_diff > threshold),
+                    color='blue', alpha=1.0, zorder=10, transform=ax3.get_xaxis_transform(),
+                    label='Diff > Threshold'
+                )
+                self.canvas.draw_idle()
+
+    def on_canvas_hover(self, event):
+        if event.inaxes is None or self.last_diff is None or self.last_t_common is None:
+            self.preview_popup.hide()
+            return
+            
+        if len(self.figure.axes) >= 1 and event.inaxes == self.figure.axes[0]:
+            t_hover = event.xdata
+            if t_hover is None:
+                self.preview_popup.hide()
+                return
+                
+            idx = np.searchsorted(self.last_t_common, t_hover)
+            idx = np.clip(idx, 0, len(self.last_diff) - 1)
+            
+            diff_val = self.last_diff[idx]
+            sigma_multiplier = self.slider_diff.value() / 20.0
+            threshold = self.baseline_diff + (sigma_multiplier * self.std_diff)
+            
+            if diff_val > threshold:
+                time_str = format_time(t_hover)
+                a_fps = self.audio_fps or 25.0
+                v_fps = self.video_fps or 25.0
+                
+                shift = self.last_shift or 0.0
+                scale = self.last_scale or 1.0
+                mode = self.last_mode or 0
+                
+                if mode == 0:
+                    t_audio = t_hover
+                    t_video = (t_hover - shift) / scale
+                else:
+                    t_video = t_hover
+                    t_audio = (t_hover - shift) / scale
+                    
+                a_frame = int(t_audio * a_fps)
+                v_frame = int(t_video * v_fps)
+                
+                pix_audio = get_thumbnail(self.audio_thumbnails, t_audio)
+                pix_video = get_thumbnail(self.video_thumbnails, t_video)
+                
+                diff_sigma = (diff_val - self.baseline_diff) / (self.std_diff + 1e-6)
+                
+                header_text = f"⏱ Time: {time_str} ({t_hover:.2f}s)   |   Diff: {diff_val:.3f} ({diff_sigma:.1f}σ)"
+                footer_text = f"🎵 Audio Frame: #{a_frame} ({t_audio:.2f}s)     •     🎬 Video Frame: #{v_frame} ({t_video:.2f}s)"
+                
+                self.preview_popup.update_preview(header_text, pix_audio, pix_video, footer_text)
+                
+                cursor_pos = QCursor.pos()
+                self.preview_popup.move(cursor_pos + QPoint(15, 15))
+                self.preview_popup.show()
+                self.preview_popup.raise_()
+            else:
+                self.preview_popup.hide()
+        else:
+            self.preview_popup.hide()
+
+    def start_sync_save(self):
+        if not self.output_folder_path:
+            self.log("ERROR: Please select an Output Folder first.")
+            return
+            
+        audio_idx, video_idx = self.get_current_indices()
+        audio_file = self.audio_files[audio_idx]
+        video_file = self.video_files[video_idx]
+        
+        base_name = os.path.splitext(os.path.basename(audio_file))[0]
+        output_file = os.path.join(self.output_folder_path, f"{base_name}_synced.mkv")
+        
+        shift = self.last_shift
+        scale = self.last_scale
+        mode = self.last_mode
+        
+        if mode == 0:
+            if shift > 0:
+                trim_audio = shift
+                trim_video = 0.0
+            else:
+                trim_audio = 0.0
+                trim_video = abs(shift) / scale
+        else:
+            if shift > 0:
+                trim_video = shift
+                trim_audio = 0.0
+            else:
+                trim_video = 0.0
+                trim_audio = abs(shift) / scale
+                
+        cmd = ["ffmpeg", "-y"]
+        
+        if trim_audio > 0:
+            cmd.extend(["-ss", f"{trim_audio:.4f}"])
+        cmd.extend(["-i", audio_file])
+        
+        if trim_video > 0:
+            cmd.extend(["-ss", f"{trim_video:.4f}"])
+            
+        if abs(scale - 1.0) > 0.001 and mode == 0:
+            cmd.extend(["-itsscale", f"{scale:.5f}"])
+            
+        cmd.extend(["-i", video_file])
+        
+        cmd.extend(["-map", "0:a:0", "-map", "1:v:0"])
+        
+        if abs(scale - 1.0) < 0.001:
+            cmd.extend(["-c", "copy"])
+        else:
+            if mode == 0:
+                cmd.extend(["-c", "copy"])
+            else:
+                cmd.extend(["-c:v", "copy", "-c:a", "aac", "-filter:a", f"atempo={1/scale:.5f}"])
+                
+        cmd.extend(["-shortest", output_file])
+        
+        self.btn_analyze.setEnabled(False)
+        self.btn_sync_save.setEnabled(False)
+        self.log(f"Starting ffmpeg...")
+        
+        self.ffmpeg_worker = FFmpegWorker(cmd)
+        self.ffmpeg_worker.log_signal.connect(self.log)
+        self.ffmpeg_worker.finished_signal.connect(self.on_sync_finished)
+        self.ffmpeg_worker.start()
+
+    def on_sync_finished(self, success, msg):
+        self.log(msg)
+        self.btn_analyze.setEnabled(True)
+        self.btn_sync_save.setEnabled(True)
 
 
 if __name__ == "__main__":
