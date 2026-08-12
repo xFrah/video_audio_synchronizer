@@ -668,14 +668,28 @@ class VideoAudioSyncApp(QMainWindow):
         # Plot Aligned Gradients
         if mode == 0:
             ax3.plot(t1, grad1, color='white', label='Audio Source Gradient', linewidth=2)
-            t2_aligned = np.array(t2) * scale_factor + shift
-            ax3.plot(t2_aligned, grad2, color='cyan', label=f'Video Source (x{scale_factor:.3f} + {shift:.2f}s)', linewidth=2, linestyle='--')
+            t_aligned = np.array(t2) * scale_factor + shift
+            ax3.plot(t_aligned, grad2, color='cyan', label=f'Video Source (x{scale_factor:.3f} + {shift:.2f}s)', linewidth=2, linestyle='--')
             ax3.set_xlabel('Time (Audio Source Timebase)')
+            t_ref = t1
         else:
             ax3.plot(t2, grad2, color='white', label='Video Source Gradient', linewidth=2)
-            t1_aligned = np.array(t1) * scale_factor + shift
-            ax3.plot(t1_aligned, grad1, color='cyan', label=f'Audio Source (x{scale_factor:.3f} + {shift:.2f}s)', linewidth=2, linestyle='--')
+            t_aligned = np.array(t1) * scale_factor + shift
+            ax3.plot(t_aligned, grad1, color='cyan', label=f'Audio Source (x{scale_factor:.3f} + {shift:.2f}s)', linewidth=2, linestyle='--')
             ax3.set_xlabel('Time (Video Source Timebase)')
+            t_ref = t2
+            
+        overall_start = min(t_ref[0], t_aligned[0])
+        overall_end = max(t_ref[-1], t_aligned[-1])
+        overlap_start = max(t_ref[0], t_aligned[0])
+        overlap_end = min(t_ref[-1], t_aligned[-1])
+        
+        has_cut_label = False
+        if overall_start < overlap_start:
+            ax3.axvspan(overall_start, overlap_start, color='red', alpha=0.3, label='Cut Content')
+            has_cut_label = True
+        if overlap_end < overall_end:
+            ax3.axvspan(overlap_end, overall_end, color='red', alpha=0.3, label='' if has_cut_label else 'Cut Content')
             
         ax3.set_ylabel('Gradient Magnitude')
         ax3.set_title('Aligned Gradient Curves')
