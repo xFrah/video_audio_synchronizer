@@ -369,6 +369,7 @@ class VideoAudioSyncApp(QMainWindow):
         self.baseline_diff = 0.0
         self.std_diff = 0.0
         self.diff_collection = None
+        self.removal_collection = None
         self.audio_thumbnails = []
         self.video_thumbnails = []
         
@@ -1054,6 +1055,47 @@ class VideoAudioSyncApp(QMainWindow):
         if self.slider_diff.isEnabled():
             self.update_diff_plot()
 
+    def get_diff_mask(self, threshold, min_consecutive=2):
+        if self.last_diff is None:
+            return None
+        is_above = self.last_diff > threshold
+        if not np.any(is_above):
+            return is_above
+            
+        mask = np.zeros_like(is_above, dtype=bool)
+        padded = np.pad(is_above.astype(int), (1, 1), 'constant')
+        diffs = np.diff(padded)
+        starts = np.where(diffs == 1)[0]
+        ends = np.where(diffs == -1)[0]
+        
+        for s, e in zip(starts, ends):
+            if (e - s) >= min_consecutive:
+                mask[s:e] = True
+                
+        return mask
+
+    def get_removal_mask(self, threshold, min_density=0.50):
+        if self.last_diff is None or self.last_t_common is None:
+            return None
+
+        blue_mask = self.get_diff_mask(threshold, min_consecutive=2)
+        if blue_mask is None or not np.any(blue_mask):
+            return None
+
+        removal_mask = np.zeros_like(blue_mask, dtype=bool)
+        n = len(self.last_t_common)
+
+        for i in range(n):
+            if blue_mask[i]:
+                remaining = n - i
+                if remaining > 0:
+                    density = np.sum(blue_mask[i:]) / remaining
+                    if density >= min_density:
+                        removal_mask[i:] = True
+                        break
+
+        return removal_mask
+
     def update_diff_plot(self):
         sigma_multiplier = self.slider_diff.value() / 20.0
         threshold = self.baseline_diff + (sigma_multiplier * self.std_diff)
@@ -1068,13 +1110,33 @@ class VideoAudioSyncApp(QMainWindow):
                         self.diff_collection.remove()
                     except ValueError:
                         pass
+                    self.diff_collection = None
+
+                if hasattr(self, 'removal_collection') and self.removal_collection is not None:
+                    try:
+                        self.removal_collection.remove()
+                    except ValueError:
+                        pass
+                    self.removal_collection = None
                         
-                self.diff_collection = ax3.fill_between(
-                    self.last_t_common, 0, 1,
-                    where=(self.last_diff > threshold),
-                    color='blue', alpha=1.0, zorder=10, transform=ax3.get_xaxis_transform(),
-                    label='Diff > Threshold'
-                )
+                mask = self.get_diff_mask(threshold)
+                if mask is not None and np.any(mask):
+                    self.diff_collection = ax3.fill_between(
+                        self.last_t_common, 0, 1,
+                        where=mask,
+                        color='blue', alpha=1.0, zorder=10, transform=ax3.get_xaxis_transform(),
+                        label='Diff > Threshold'
+                    )
+
+                removal_mask = self.get_removal_mask(threshold, min_density=0.50)
+                if removal_mask is not None and np.any(removal_mask):
+                    self.removal_collection = ax3.fill_between(
+                        self.last_t_common, 0, 0.04,
+                        where=removal_mask,
+                        color='red', alpha=1.0, zorder=15, transform=ax3.get_xaxis_transform(),
+                        label='To Be Removed'
+                    )
+
                 self.canvas.draw_idle()
 
     def on_canvas_hover(self, event):
@@ -1095,7 +1157,8 @@ class VideoAudioSyncApp(QMainWindow):
             sigma_multiplier = self.slider_diff.value() / 20.0
             threshold = self.baseline_diff + (sigma_multiplier * self.std_diff)
             
-            if diff_val > threshold:
+            mask = self.get_diff_mask(threshold)
+            if mask is not None and mask[idx]:
                 time_str = format_time(t_hover)
                 a_fps = self.audio_fps or 25.0
                 v_fps = self.video_fps or 25.0
@@ -1119,7 +1182,11 @@ class VideoAudioSyncApp(QMainWindow):
                 
                 diff_sigma = (diff_val - self.baseline_diff) / (self.std_diff + 1e-6)
                 
-                header_text = f"⏱ Time: {time_str} ({t_hover:.2f}s)   |   Diff: {diff_val:.3f} ({diff_sigma:.1f}σ)"
+                removal_mask = self.get_removal_mask(threshold, min_density=0.50)
+                is_removal = removal_mask is not None and removal_mask[idx]
+                status_icon = "   |   🛑 TO BE REMOVED" if is_removal else ""
+
+                header_text = f"⏱ Time: {time_str} ({t_hover:.2f}s)   |   Diff: {diff_val:.3f} ({diff_sigma:.1f}σ){status_icon}"
                 footer_text = f"🎵 Audio Frame: #{a_frame} ({t_audio:.2f}s)     •     🎬 Video Frame: #{v_frame} ({t_video:.2f}s)"
                 
                 self.preview_popup.update_preview(header_text, pix_audio, pix_video, footer_text)
@@ -1166,6 +1233,20 @@ class VideoAudioSyncApp(QMainWindow):
                 
         cmd = ["ffmpeg", "-y"]
         
+        slider_val = self.slider_diff.value()
+        sigma_multiplier = slider_val / 20.0
+        threshold = self.baseline_diff + (sigma_multiplier * self.std_diff)
+        removal_mask = self.get_removal_mask(threshold, min_density=0.50)
+        
+        duration_to_encode = None
+        if removal_mask is not None and np.any(removal_mask):
+            cut_idx = np.argmax(removal_mask)
+            t_cut = self.last_t_common[cut_idx]
+            if mode == 0:
+                duration_to_encode = max(0.0, t_cut - trim_audio)
+            else:
+                duration_to_encode = max(0.0, t_cut - trim_video)
+        
         if trim_audio > 0:
             cmd.extend(["-ss", f"{trim_audio:.4f}"])
         cmd.extend(["-i", audio_file])
@@ -1188,6 +1269,9 @@ class VideoAudioSyncApp(QMainWindow):
             else:
                 cmd.extend(["-c:v", "copy", "-c:a", "aac", "-filter:a", f"atempo={1/scale:.5f}"])
                 
+        if duration_to_encode is not None:
+            cmd.extend(["-t", f"{duration_to_encode:.4f}"])
+            
         cmd.extend(["-shortest", output_file])
         
         self.btn_analyze.setEnabled(False)

@@ -1,0 +1,6 @@
+{
+    "app_mode": "folder",
+    "input_path": "M:/Hero 108/Stagione 1",
+    "output_path": "M:/Hero 108 splitter",
+    "naming_template": "{basename}_S01E{index:02d}.mkv"
+}
