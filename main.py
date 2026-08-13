@@ -2,12 +2,17 @@ import sys
 import os
 import glob
 import json
+import time
 import av
 import numpy as np
 import matplotlib.pyplot as plt
 import subprocess
 from scipy import signal, interpolate
 from natsort import natsorted
+import pickle
+import hashlib
+import concurrent.futures
+import multiprocessing
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -240,107 +245,243 @@ class FFmpegWorker(QThread):
                 pass
 
 
+def get_cache_path(cache_dir, filepath):
+    h = hashlib.md5(os.path.abspath(filepath).encode('utf-8')).hexdigest()
+    return os.path.join(cache_dir, f"{h}.pkl")
+
+def process_video_file(video_path, output_path, max_frames=float('inf'), frame_step=1, progress_queue=None):
+    """Module-level function for multiprocessing extraction."""
+    try:
+        container = av.open(video_path)
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        
+        timestamps = []
+        reds = []
+        greens = []
+        blues = []
+        hues = []
+
+        fps = None
+        try:
+            rate = stream.average_rate or stream.r_frame_rate
+            if rate and rate.denominator != 0:
+                fps = float(rate)
+        except Exception:
+            pass
+
+        frame_number = 0
+        first_frame_time = None
+        last_frame_time = None
+        
+        for frame in container.decode(stream):
+            if frame_number >= max_frames:
+                break
+            
+            if first_frame_time is None:
+                first_frame_time = frame.time
+            last_frame_time = frame.time
+            
+            frame_number += 1
+            if progress_queue and frame_number % 50 == 0:
+                progress_queue.put(50)
+            
+            if (frame_number - 1) % frame_step != 0:
+                continue
+            
+            small_frame = frame.reformat(width=200, height=112, format="rgb24")
+            image = small_frame.to_ndarray()
+            r, g, b, h = get_color_percentages(image)
+            
+            timestamps.append(frame.time)
+            reds.append(r)
+            greens.append(g)
+            blues.append(b)
+            hues.append(h)
+                
+        container.close()
+        
+        if progress_queue and frame_number % 50 != 0:
+            progress_queue.put(frame_number % 50)
+        
+        if not fps or fps <= 0:
+            if first_frame_time is not None and last_frame_time is not None and last_frame_time > first_frame_time:
+                duration = last_frame_time - first_frame_time
+                fps = (frame_number - 1) / duration
+            else:
+                raise ValueError("Could not determine FPS from metadata or frame timestamps")
+                
+        data = (timestamps, reds, greens, blues, hues, [], fps)
+        tmp_path = output_path + ".tmp"
+        with open(tmp_path, 'wb') as f:
+            pickle.dump(data, f)
+        os.replace(tmp_path, output_path)
+        return True
+    except Exception as e:
+        return e
+
+
+class IndexWorker(QThread):
+    progress_signal = pyqtSignal(int, int, str)
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool, str)
+    
+    def __init__(self, audio_files, video_files, output_dir, frame_step=1, max_frames=float('inf'), resume=True):
+        super().__init__()
+        self.resume = resume
+        self.audio_files = audio_files
+        self.video_files = video_files
+        self.output_dir = output_dir
+        self.frame_step = max(1, frame_step)
+        self.max_frames = max_frames
+        self._is_cancelled = False
+        self.cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sync_cache")
+
+    def cancel(self):
+        self._is_cancelled = True
+        if hasattr(self, 'executor'):
+            self.executor.shutdown(wait=False, cancel_futures=True)
+
+    def run(self):
+        os.makedirs(self.cache_dir, exist_ok=True)
+        all_files = self.audio_files + self.video_files
+        total_files = len(all_files)
+        
+        self.progress_signal.emit(0, total_files, "Checking existing cache...")
+        files_to_process = []
+        for i, file_path in enumerate(all_files):
+            self.progress_signal.emit(i, total_files, f"Checking cache {i}/{total_files}...")
+            if self._is_cancelled:
+                self.finished_signal.emit(False, "Indexing stopped by user.")
+                return
+                
+            cache_path = get_cache_path(self.cache_dir, file_path)
+            if self.resume and os.path.exists(cache_path):
+                try:
+                    with open(cache_path, 'rb') as f:
+                        data = pickle.load(f)
+                        if isinstance(data, tuple) and len(data) >= 6:
+                            continue
+                except:
+                    pass
+            
+            if os.path.exists(cache_path):
+                try:
+                    os.remove(cache_path)
+                except Exception:
+                    pass
+            
+            files_to_process.append((file_path, cache_path))
+            time.sleep(0.005)  # Yield GIL to prevent GUI freeze
+            
+        if not files_to_process:
+            self.finished_signal.emit(True, "All files are already indexed.")
+            return
+                
+        self.progress_signal.emit(0, len(files_to_process), "Calculating total frames...")
+        total_frames_to_process = 0
+        for i, (fp, cp) in enumerate(files_to_process):
+            time.sleep(0.005)  # Yield GIL to prevent GUI freeze
+            if self._is_cancelled:
+                self.finished_signal.emit(False, "Indexing stopped by user.")
+                return
+                
+            self.progress_signal.emit(i, len(files_to_process), f"Calculating total frames {i}/{len(files_to_process)}...")
+            try:
+                container = av.open(fp)
+                stream = container.streams.video[0]
+                frames = stream.frames
+                if not frames or frames == 0:
+                    rate = stream.average_rate or stream.r_frame_rate
+                    fps = float(rate) if rate and rate.denominator != 0 else 25.0
+                    dur = 0
+                    if stream.duration and stream.time_base:
+                        dur = float(stream.duration * stream.time_base)
+                    elif container.duration:
+                        dur = container.duration / 1000000.0
+                    frames = int(dur * fps)
+                total_frames_to_process += min(frames, self.max_frames)
+                container.close()
+            except Exception:
+                pass
+                
+        manager = multiprocessing.Manager()
+        progress_queue = manager.Queue()
+
+        self.executor = concurrent.futures.ProcessPoolExecutor()
+        futures = {
+            self.executor.submit(process_video_file, fp, cp, self.max_frames, self.frame_step, progress_queue): (fp, cp)
+            for fp, cp in files_to_process
+        }
+        
+        processed_frames = 0
+        self.progress_signal.emit(0, total_frames_to_process, f"Processed 0/{total_frames_to_process} frames")
+        
+        import queue
+        while not all(f.done() for f in futures):
+            if self._is_cancelled:
+                self.executor.shutdown(wait=False, cancel_futures=True)
+                self.finished_signal.emit(False, "Indexing stopped by user.")
+                return
+                
+            try:
+                msg = progress_queue.get(timeout=0.2)
+                processed_frames += msg
+                self.progress_signal.emit(processed_frames, total_frames_to_process, f"Processed {processed_frames}/{total_frames_to_process} frames")
+            except queue.Empty:
+                pass
+                
+        # Drain remaining items in the queue just in case
+        while not progress_queue.empty():
+            try:
+                processed_frames += progress_queue.get_nowait()
+            except queue.Empty:
+                break
+        self.progress_signal.emit(processed_frames, total_frames_to_process, f"Processed {processed_frames}/{total_frames_to_process} frames")
+        
+        has_errors = False
+        for future in concurrent.futures.as_completed(futures):
+            fp, cp = futures[future]
+            try:
+                result = future.result()
+                if isinstance(result, Exception):
+                    self.log_signal.emit(f"Error indexing {os.path.basename(fp)}: {result}")
+                    has_errors = True
+                elif result is not True:
+                    self.log_signal.emit(f"Error indexing {os.path.basename(fp)}: {result}")
+                    has_errors = True
+            except Exception as e:
+                self.log_signal.emit(f"Failed to process {os.path.basename(fp)}: {e}")
+                has_errors = True
+
+        self.executor.shutdown(wait=True)
+        
+        if not self._is_cancelled and not has_errors:
+            self.finished_signal.emit(True, "Indexing complete.")
+        else:
+            self.finished_signal.emit(False, "Indexing failed due to errors.")
+
+
 class AnalysisWorker(QThread):
     progress_signal = pyqtSignal(int, int, str)
     log_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(object, object, float, float, int)
     error_signal = pyqtSignal(str)
 
-    def __init__(self, file1, file2, scale_factor, mode, frame_step=1, max_frames=float('inf')):
+    def __init__(self, data1, data2, scale_factor, mode):
         super().__init__()
-        self.file1 = file1
-        self.file2 = file2
+        self.data1 = data1
+        self.data2 = data2
         self.scale_factor = scale_factor
         self.mode = mode
-        self.frame_step = max(1, frame_step)
-        self.max_frames = max_frames
         self._is_cancelled = False
 
-    def analyze_video(self, video_path, label):
-        self.log_signal.emit(f"Analyzing {label}: {os.path.basename(video_path)}")
-        try:
-            container = av.open(video_path)
-            stream = container.streams.video[0]
-            stream.thread_type = "AUTO"
-            
-            timestamps = []
-            reds = []
-            greens = []
-            blues = []
-            hues = []
-            thumbnails = []
-
-            total_frames = stream.frames
-            if not total_frames or total_frames == 0:
-                try:
-                    dur = 0
-                    if stream.duration and stream.time_base:
-                        dur = float(stream.duration * stream.time_base)
-                    elif container.duration:
-                        dur = container.duration / 1000000.0
-                    
-                    rate = stream.average_rate or stream.r_frame_rate
-                    if dur > 0 and rate:
-                        total_frames = int(dur * float(rate))
-                except Exception:
-                    total_frames = 0
-
-            if not total_frames or total_frames == 0:
-                total_to_process = 0
-            else:
-                total_to_process = min(total_frames, self.max_frames)
-            
-            frame_number = 0
-            processed_count = 0
-            for frame in container.decode(stream):
-                if self._is_cancelled:
-                    break
-                if frame_number >= self.max_frames:
-                    break
-                frame_number += 1
-                
-                if (frame_number - 1) % self.frame_step != 0:
-                    continue
-                
-                small_frame = frame.reformat(width=200, height=112, format="rgb24")
-                image = small_frame.to_ndarray()
-                r, g, b, h = get_color_percentages(image)
-                
-                timestamps.append(frame.time)
-                reds.append(r)
-                greens.append(g)
-                blues.append(b)
-                hues.append(h)
-                thumbnails.append((frame.time, bytes(image), 200, 112))
-                processed_count += 1
-                
-                if processed_count % 5 == 0 or frame_number == 1:
-                    self.progress_signal.emit(frame_number, total_to_process, f"Analyzing {label}...")
-                    
-            container.close()
-            return timestamps, reds, greens, blues, hues, thumbnails
-        except Exception as e:
-            self.error_signal.emit(f"Error analyzing {video_path}: {str(e)}")
-            return None
-
     def run(self):
-        data1 = self.analyze_video(self.file1, "Audio Source")
-        if self._is_cancelled:
-            self.error_signal.emit("Analysis stopped by user.")
-            return
-        if not data1: return
-        
-        data2 = self.analyze_video(self.file2, "Video Source")
-        if self._is_cancelled:
-            self.error_signal.emit("Analysis stopped by user.")
-            return
-        if not data2: return
-        
         self.log_signal.emit("Calculating time shift...")
         self.progress_signal.emit(0, 0, "Calculating shift...")
         
-        t1, r1, g1, b1, h1 = data1[:5]
-        t2, r2, g2, b2, h2 = data2[:5]
+        t1, r1, g1, b1, h1 = self.data1[:5]
+        t2, r2, g2, b2, h2 = self.data2[:5]
         
         grad1 = np.array(h1)
         grad2 = np.array(h2)
@@ -351,7 +492,7 @@ class AnalysisWorker(QThread):
             shift = find_time_shift(t2, grad2, t1, grad1, self.scale_factor, log_callback=lambda m: self.log_signal.emit(m))
         
         if not self._is_cancelled:
-            self.finished_signal.emit(data1, data2, self.scale_factor, shift, self.mode)
+            self.finished_signal.emit(self.data1, self.data2, self.scale_factor, shift, self.mode)
         else:
             self.error_signal.emit("Analysis stopped by user.")
 
@@ -388,6 +529,8 @@ class VideoAudioSyncApp(QMainWindow):
         self.removal_collection = None
         self.audio_thumbnails = []
         self.video_thumbnails = []
+        self.hover_container_audio = None
+        self.hover_container_video = None
         
         self.app_mode = "folder"
         self.settings_file = "settings.json"
@@ -441,6 +584,29 @@ class VideoAudioSyncApp(QMainWindow):
         h1.addWidget(self.btn_output)
         h1.addWidget(self.lbl_output, stretch=1)
         
+        # Index Files Button
+        h_index = QHBoxLayout()
+        self.btn_index = QPushButton("Index Files")
+        self.btn_index.clicked.connect(self.toggle_indexing)
+        self.btn_index.setEnabled(False)
+        
+        self.btn_reindex = QPushButton("Re-index Files")
+        self.btn_reindex.clicked.connect(self.trigger_reindex)
+        self.btn_reindex.setEnabled(False)
+        
+        self.progress_index = QProgressBar()
+        self.progress_index.setValue(0)
+        self.progress_index.setVisible(False)
+        self.progress_index.setTextVisible(True)
+        
+        self.index_status = QLabel("")
+        self.index_status.setStyleSheet("color: #fbbc04; font-weight: bold;")
+        
+        h_index.addWidget(self.btn_index)
+        h_index.addWidget(self.btn_reindex)
+        h_index.addWidget(self.progress_index, stretch=1)
+        h_index.addWidget(self.index_status)
+        
         self.info_audio = QLabel("")
         self.info_audio.setStyleSheet("color: gray;")
         
@@ -459,39 +625,14 @@ class VideoAudioSyncApp(QMainWindow):
         files_layout.addWidget(self.info_audio)
         files_layout.addLayout(h2)
         files_layout.addWidget(self.info_video)
+        files_layout.addLayout(h_index)
         files_group.setLayout(files_layout)
         main_layout.addWidget(files_group)
         
-        # Mapping Settings
-        self.mapping_group = QGroupBox("Mapping Settings")
-        mapping_layout = QVBoxLayout()
-        
-        ratio_layout = QHBoxLayout()
-        ratio_layout.addWidget(QLabel("Ratio (Audio:Video):"))
-        self.spin_ratio_a = QSpinBox()
-        self.spin_ratio_a.setRange(1, 100)
-        self.spin_ratio_a.setValue(1)
-        self.spin_ratio_a.valueChanged.connect(self.on_ratio_changed)
-        
-        self.spin_ratio_v = QSpinBox()
-        self.spin_ratio_v.setRange(1, 100)
-        self.spin_ratio_v.setValue(1)
-        self.spin_ratio_v.valueChanged.connect(self.on_ratio_changed)
-        
-        ratio_layout.addWidget(self.spin_ratio_a)
-        ratio_layout.addWidget(QLabel(":"))
-        ratio_layout.addWidget(self.spin_ratio_v)
-        ratio_layout.addStretch()
-        
-        mapping_layout.addLayout(ratio_layout)
-        
-        lbl_mapping_desc = QLabel("Ratio of Audio files to Video files. For example, 1:2 means 1 Audio file corresponds to 2 Video files.")
-        lbl_mapping_desc.setStyleSheet("font-style: italic; color: gray;")
-        lbl_mapping_desc.setWordWrap(True)
-        mapping_layout.addWidget(lbl_mapping_desc)
-        
-        self.mapping_group.setLayout(mapping_layout)
-        main_layout.addWidget(self.mapping_group)
+        # Lower Panel
+        self.lower_panel = QWidget()
+        lower_layout = QVBoxLayout(self.lower_panel)
+        lower_layout.setContentsMargins(0, 0, 0, 0)
         
         # Current Pair Details
         pair_group = QGroupBox("Current Pair Details")
@@ -531,7 +672,7 @@ class VideoAudioSyncApp(QMainWindow):
         pair_layout.addWidget(self.info_pair_video)
         
         pair_group.setLayout(pair_layout)
-        main_layout.addWidget(pair_group)
+        lower_layout.addWidget(pair_group)
         
         # Settings
         settings_group = QGroupBox("Analysis & Scaling Settings")
@@ -550,7 +691,7 @@ class VideoAudioSyncApp(QMainWindow):
         settings_layout.addRow("Frame Sampling (1 in N frames):", self.spin_frame_step)
         settings_layout.addRow("Scaling Mode:", self.combo_scale)
         settings_group.setLayout(settings_layout)
-        main_layout.addWidget(settings_group)
+        lower_layout.addWidget(settings_group)
         
         # Controls and Progress
         controls_layout = QHBoxLayout()
@@ -580,7 +721,7 @@ class VideoAudioSyncApp(QMainWindow):
         controls_layout.addWidget(self.btn_stop)
         controls_layout.addWidget(self.progress_bar, stretch=1)
         controls_layout.addWidget(self.lbl_status)
-        main_layout.addLayout(controls_layout)
+        lower_layout.addLayout(controls_layout)
         
         # Diff Threshold
         diff_layout = QHBoxLayout()
@@ -594,13 +735,13 @@ class VideoAudioSyncApp(QMainWindow):
         self.lbl_diff_val = QLabel("1.0σ")
         diff_layout.addWidget(self.slider_diff, stretch=1)
         diff_layout.addWidget(self.lbl_diff_val)
-        main_layout.addLayout(diff_layout)
+        lower_layout.addLayout(diff_layout)
         
         # Logs
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumHeight(150)
-        main_layout.addWidget(self.log_text)
+        lower_layout.addWidget(self.log_text)
         
         # Plot Canvas
         self.figure = Figure(figsize=(8, 6))
@@ -608,8 +749,186 @@ class VideoAudioSyncApp(QMainWindow):
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setStyleSheet("background-color: transparent;")
         self.canvas.mpl_connect("motion_notify_event", self.on_canvas_hover)
-        main_layout.addWidget(self.canvas, stretch=1)
+        self.canvas.mpl_connect("axes_leave_event", lambda e: self.preview_popup.hide())
+        lower_layout.addWidget(self.canvas)
         
+        main_layout.addWidget(self.lower_panel)
+        self.lower_panel.setEnabled(False)
+        
+    def toggle_indexing(self):
+        if self.btn_index.text() == "Stop Indexing":
+            self.stop_indexing()
+        else:
+            self.start_indexing(resume=True)
+            
+    def trigger_reindex(self):
+        self.reset_ui()
+        self.start_indexing(resume=False)
+            
+    def stop_indexing(self):
+        if hasattr(self, 'index_worker') and self.index_worker.isRunning():
+            self.index_worker.cancel()
+            self.index_status.setText("Stopping...")
+            self.btn_index.setEnabled(False)
+            
+    def reset_ui(self):
+        self.lower_panel.setEnabled(False)
+        if hasattr(self, 'matched_pairs'):
+            self.matched_pairs = []
+        self.current_pair_idx = 0
+        self.lbl_nav.setText("Pair 0 of 0")
+        self.lbl_pair_audio.setText("No audio file")
+        self.lbl_pair_video.setText("No video file")
+        self.info_pair_audio.setText("")
+        self.info_pair_video.setText("")
+        self.combo_scale.setEnabled(False)
+        self.figure.clear()
+        self.canvas.draw()
+        self.log_text.clear()
+        self.progress_bar.setValue(0)
+        self.lbl_status.setText("Ready")
+        
+    def start_indexing(self, resume=True):
+        self.btn_index.setText("Stop Indexing")
+        self.btn_index.setStyleSheet("""
+            QPushButton { background-color: #d32f2f; color: white; }
+            QPushButton:disabled { background-color: #555555; color: #aaaaaa; }
+        """)
+        self.btn_reindex.setEnabled(False)
+        self.progress_index.setVisible(True)
+        self.progress_index.setValue(0)
+        
+        self.lower_panel.setEnabled(False)
+        self.index_status.setText("Indexing...")
+        
+        self.index_worker = IndexWorker(
+            self.audio_files,
+            self.video_files,
+            self.output_folder_path,
+            self.spin_frame_step.value(),
+            float('inf'),
+            resume=resume
+        )
+        self.index_worker.progress_signal.connect(self.update_index_progress)
+        self.index_worker.log_signal.connect(self.log)
+        self.index_worker.finished_signal.connect(self.on_index_finished)
+        self.index_worker.start()
+
+    def update_index_progress(self, val, total, status):
+        self.progress_index.setMaximum(total)
+        self.progress_index.setValue(val)
+        self.index_status.setText(status)
+
+    def on_index_finished(self, success, msg):
+        self.btn_index.setStyleSheet("")
+        self.btn_index.setText("Index Files" if success else "Resume Indexing")
+        self.btn_index.setEnabled(True)
+        self.btn_reindex.setEnabled(self.has_cache_files())
+        self.progress_index.setVisible(False)
+        self.log(msg)
+        
+        if success:
+            self.index_status.setText("Indexed ✅")
+            self.lower_panel.setEnabled(True)
+            self.perform_matching()
+        else:
+            self.index_status.setText("Failed")
+
+    def perform_matching(self):
+        self.log("Loading indexed curves into RAM...")
+        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sync_cache")
+        
+        video_curves = {}
+        for vf in self.video_files:
+            cache_path = get_cache_path(cache_dir, vf)
+            try:
+                with open(cache_path, 'rb') as f:
+                    data = pickle.load(f)
+                    video_curves[vf] = data
+            except:
+                continue
+
+        self.log("Matching audio to video files...")
+        self.matched_pairs = []
+        
+        for af in self.audio_files:
+            a_cache_path = get_cache_path(cache_dir, af)
+            try:
+                with open(a_cache_path, 'rb') as f:
+                    a_data = pickle.load(f)
+            except:
+                continue
+                
+            t1, r1, g1, b1, h1 = a_data[:5]
+            a_fps = a_data[6]
+            y1 = np.array(h1)
+            
+            best_match_file = None
+            best_match_peak = -float('inf')
+            
+            for vf, v_data in video_curves.items():
+                t2, r2, g2, b2, h2 = v_data[:5]
+                v_fps = v_data[6]
+                y2 = np.array(h2)
+                
+                scale_factor = 1.0
+                mode = self.combo_scale.currentIndex()
+                if mode == 0:
+                    scale_factor = a_fps / v_fps if v_fps else 1.0
+                else:
+                    scale_factor = v_fps / a_fps if a_fps else 1.0
+                
+                t2_scaled = np.array(t2) * scale_factor
+                
+                fs = 200.0
+                try:
+                    t1_uniform = np.arange(t1[0], t1[-1], 1/fs)
+                    interp1 = interpolate.interp1d(t1, y1, kind='linear', fill_value="extrapolate")
+                    y1_uniform = interp1(t1_uniform)
+                    y1_centered = y1_uniform - np.mean(y1_uniform)
+                    
+                    t2_uniform = np.arange(t2_scaled[0], t2_scaled[-1], 1/fs)
+                    interp2 = interpolate.interp1d(t2_scaled, y2, kind='linear', fill_value="extrapolate")
+                    y2_uniform = interp2(t2_uniform)
+                    y2_centered = y2_uniform - np.mean(y2_uniform)
+                    
+                    corr = signal.correlate(y1_centered, y2_centered, mode='valid')
+                    if len(corr) == 0:
+                        continue
+                    peak = np.max(corr)
+                    
+                    if peak > best_match_peak:
+                        best_match_peak = peak
+                        best_match_file = vf
+                except:
+                    continue
+            
+            if best_match_file:
+                self.matched_pairs.append((af, best_match_file))
+                self.log(f"Matched Audio: {os.path.basename(af)} -> Video: {os.path.basename(best_match_file)}")
+            else:
+                self.log(f"Failed to find match for {os.path.basename(af)}")
+                
+        self.current_pair_idx = 0
+        self.load_current_pair()
+
+    def has_cache_files(self):
+        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sync_cache")
+        if os.path.exists(cache_dir):
+            for f in os.listdir(cache_dir):
+                if f.endswith('.pkl'):
+                    return True
+        return False
+
+    def update_files_list(self):
+        valid = len(self.audio_files) > 0 and len(self.video_files) > 0 and self.output_folder_path is not None
+        self.btn_index.setEnabled(valid)
+        self.btn_reindex.setEnabled(valid and self.has_cache_files())
+        if valid and self.btn_index.text() not in ["Stop Indexing", "Resume Indexing"]:
+            self.btn_index.setText("Index Files")
+        elif not valid:
+            self.btn_index.setText("Index Files")
+
     def log(self, msg):
         self.log_text.append(msg)
         # Scroll to bottom
@@ -656,14 +975,12 @@ class VideoAudioSyncApp(QMainWindow):
         if self.app_mode == "folder":
             self.btn_audio.setText("Select Audio Folder")
             self.btn_video.setText("Select Video Folder")
-            self.mapping_group.setEnabled(True)
             self.btn_prev.setVisible(True)
             self.btn_next.setVisible(True)
             self.lbl_nav.setVisible(True)
         else:
             self.btn_audio.setText("Select Audio File")
             self.btn_video.setText("Select Video File")
-            self.mapping_group.setEnabled(False)
             self.btn_prev.setVisible(False)
             self.btn_next.setVisible(False)
             self.lbl_nav.setVisible(False)
@@ -672,6 +989,7 @@ class VideoAudioSyncApp(QMainWindow):
         self.set_folder_info(False)
         self.load_current_pair()
         self.save_settings()
+        self.update_files_list()
 
     def on_ratio_changed(self):
         self.ratio_timer.start(2000)
@@ -755,28 +1073,18 @@ class VideoAudioSyncApp(QMainWindow):
                 self.spin_frame_step.setValue(frame_step)
                 self.spin_frame_step.blockSignals(False)
                 
-                ratio_a = settings.get("ratio_a", 1)
-                ratio_v = settings.get("ratio_v", 1)
-                self.spin_ratio_a.blockSignals(True)
-                self.spin_ratio_v.blockSignals(True)
-                self.spin_ratio_a.setValue(ratio_a)
-                self.spin_ratio_v.setValue(ratio_v)
-                self.spin_ratio_a.blockSignals(False)
-                self.spin_ratio_v.blockSignals(False)
-                
                 self.current_index = 0
                 self.load_current_pair()
             except Exception as e:
                 print(f"Failed to load settings: {e}")
+        self.update_files_list()
 
     def save_settings(self):
         settings = {
             "app_mode": self.app_mode,
             "output_folder": self.output_folder_path,
             "scale_mode": self.combo_scale.currentIndex(),
-            "frame_step": self.spin_frame_step.value(),
-            "ratio_a": self.spin_ratio_a.value(),
-            "ratio_v": self.spin_ratio_v.value()
+            "frame_step": self.spin_frame_step.value()
         }
         if self.app_mode == "folder":
             settings["audio_folder"] = self.audio_folder_path
@@ -853,115 +1161,131 @@ class VideoAudioSyncApp(QMainWindow):
                 self.load_current_pair()
             self.save_settings()
 
-    def get_current_indices(self):
-        ratio_a = self.spin_ratio_a.value()
-        ratio_v = self.spin_ratio_v.value()
-        if ratio_a > 1 and ratio_v == 1:
-            return self.current_index, self.current_index // ratio_a
-        elif ratio_v > 1 and ratio_a == 1:
-            return self.current_index // ratio_v, self.current_index
-        else:
-            return self.current_index, self.current_index
-
     def load_current_pair(self):
         self.figure.clear()
         self.canvas.draw()
         
-        ratio_a = self.spin_ratio_a.value()
-        ratio_v = self.spin_ratio_v.value()
+        if self.hover_container_audio:
+            try: self.hover_container_audio.close()
+            except: pass
+        if self.hover_container_video:
+            try: self.hover_container_video.close()
+            except: pass
+            
+        self.hover_container_audio = None
+        self.hover_container_video = None
+        self.hover_stream_audio = None
+        self.hover_stream_video = None
         
-        num_audio = len(self.audio_files)
-        num_video = len(self.video_files)
-        
-        if ratio_a > 1 and ratio_v == 1:
-            total_pairs = min(num_audio, num_video * ratio_a)
-        elif ratio_v > 1 and ratio_a == 1:
-            total_pairs = min(num_audio * ratio_v, num_video)
-        else:
-            total_pairs = min(num_audio, num_video)
-        
-        if total_pairs == 0:
+        if not hasattr(self, 'matched_pairs') or len(self.matched_pairs) == 0:
             self.lbl_nav.setText("Pair 0 of 0")
             self.btn_prev.setEnabled(False)
             self.btn_next.setEnabled(False)
-            self.btn_analyze.setEnabled(False)
-            self.lbl_pair_audio.setText("No matching files")
+            self.lbl_pair_audio.setText("No audio file")
+            self.lbl_pair_video.setText("No video file")
             self.info_pair_audio.setText("")
-            self.lbl_pair_video.setText("No matching files")
             self.info_pair_video.setText("")
+            self.combo_scale.setEnabled(False)
             return
             
-        self.lbl_nav.setText(f"Pair {self.current_index + 1} of {total_pairs}")
-        self.btn_prev.setEnabled(self.current_index > 0)
-        self.btn_next.setEnabled(self.current_index < total_pairs - 1)
+        total = len(self.matched_pairs)
+        self.lbl_nav.setText(f"Pair {self.current_pair_idx + 1} of {total}")
+        self.btn_prev.setEnabled(self.current_pair_idx > 0)
+        self.btn_next.setEnabled(self.current_pair_idx < total - 1)
         
-        audio_idx, video_idx = self.get_current_indices()
-        audio_file = self.audio_files[audio_idx]
-        video_file = self.video_files[video_idx]
+        audio_file, video_file = self.matched_pairs[self.current_pair_idx]
         
-        self.lbl_pair_audio.setText(f"<b>Audio Source:</b> {os.path.basename(audio_file)}")
-        info_audio, fps_audio = self.extract_info(audio_file)
-        self.info_pair_audio.setText(info_audio)
-        self.audio_fps = fps_audio
+        self.lbl_pair_audio.setText(f"🎵 Audio: {os.path.basename(audio_file)}")
+        self.lbl_pair_video.setText(f"🎬 Video: {os.path.basename(video_file)}")
         
-        self.lbl_pair_video.setText(f"<b>Video Source:</b> {os.path.basename(video_file)}")
-        info_video, fps_video = self.extract_info(video_file)
-        self.info_pair_video.setText(info_video)
-        self.video_fps = fps_video
-        
-        self.btn_analyze.setEnabled(True)
-        if self.audio_fps and self.video_fps:
-            if abs(self.audio_fps - self.video_fps) < 0.01:
-                self.combo_scale.setEnabled(False)
-            else:
-                self.combo_scale.setEnabled(True)
+        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sync_cache")
+        try:
+            with open(get_cache_path(cache_dir, audio_file), 'rb') as f:
+                a_data = pickle.load(f)
+            with open(get_cache_path(cache_dir, video_file), 'rb') as f:
+                v_data = pickle.load(f)
+                
+            self.audio_fps = a_data[6]
+            self.video_fps = v_data[6]
+            
+            a_dur = a_data[0][-1] if len(a_data[0]) > 0 else 0
+            v_dur = v_data[0][-1] if len(v_data[0]) > 0 else 0
+            a_frames = len(a_data[0])
+            v_frames = len(v_data[0])
+            
+            self.info_pair_audio.setText(f"FPS: {self.audio_fps:.2f} | Duration: {a_dur:.2f}s | Frames: {a_frames}")
+            self.info_pair_video.setText(f"FPS: {self.video_fps:.2f} | Duration: {v_dur:.2f}s | Frames: {v_frames}")
+            
+            try:
+                self.hover_container_audio = av.open(audio_file)
+                self.hover_stream_audio = self.hover_container_audio.streams.video[0]
+                self.hover_stream_audio.thread_type = "AUTO"
+            except Exception:
+                pass
+                
+            try:
+                self.hover_container_video = av.open(video_file)
+                self.hover_stream_video = self.hover_container_video.streams.video[0]
+                self.hover_stream_video.thread_type = "AUTO"
+            except Exception:
+                pass
+            
+            self.btn_analyze.setEnabled(True)
+            self.combo_scale.setEnabled(True)
+            
+            if self.audio_fps and self.video_fps and abs(self.audio_fps - self.video_fps) > 0.1:
+                self.info_pair_audio.setText(self.info_pair_audio.text() + " ⚠️ FPS MISMATCH")
+                self.info_pair_video.setText(self.info_pair_video.text() + " ⚠️ FPS MISMATCH")
+        except Exception as e:
+            self.log(f"Error loading cache for pair: {e}")
+            self.btn_analyze.setEnabled(False)
 
     def next_pair(self):
-        self.current_index += 1
+        self.current_pair_idx += 1
         self.load_current_pair()
         
     def prev_pair(self):
-        self.current_index -= 1
+        self.current_pair_idx -= 1
         self.load_current_pair()
 
     def start_analysis(self):
-        if not self.audio_files or not self.video_files:
+        if not hasattr(self, 'matched_pairs') or not self.matched_pairs:
             return
             
-        audio_idx, video_idx = self.get_current_indices()
-        audio_file = self.audio_files[audio_idx]
-        video_file = self.video_files[video_idx]
+        audio_file, video_file = self.matched_pairs[self.current_pair_idx]
+        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sync_cache")
+        
+        try:
+            with open(get_cache_path(cache_dir, audio_file), 'rb') as f:
+                data1 = pickle.load(f)
+            with open(get_cache_path(cache_dir, video_file), 'rb') as f:
+                data2 = pickle.load(f)
+        except Exception as e:
+            self.log(f"Cache missing for analysis: {e}")
+            return
             
         self.btn_analyze.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.log_text.clear()
         self.figure.clear()
         self.canvas.draw()
-        
         self.progress_bar.setValue(0)
-        self.progress_bar.setMaximum(100)
-        self.lbl_status.setText("Starting analysis...")
         
-        if self.audio_fps and self.video_fps:
-            if abs(self.audio_fps - self.video_fps) < 0.01:
-                scale_factor = 1.0
-                mode = 0
-            else:
-                mode = self.combo_scale.currentIndex()
-                if mode == 0:
-                    scale_factor = self.video_fps / self.audio_fps
-                else:
-                    scale_factor = self.audio_fps / self.video_fps
+        mode = self.combo_scale.currentIndex()
+        if mode == 0:
+            scale_factor = self.audio_fps / self.video_fps if self.video_fps else 1.0
         else:
-            scale_factor = 1.0
-            mode = 0
+            scale_factor = self.video_fps / self.audio_fps if self.audio_fps else 1.0
             
+        self.lbl_status.setText("Analyzing...")
         self.log(f"Using scale factor: {scale_factor:.5f}")
         
-        frame_step = self.spin_frame_step.value()
-        self.log(f"Frame sampling rate: 1 in {frame_step} frames")
-        
-        self.worker = AnalysisWorker(audio_file, video_file, scale_factor, mode, frame_step=frame_step)
+        self.worker = AnalysisWorker(
+            data1,
+            data2,
+            scale_factor,
+            mode
+        )
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.log_signal.connect(self.log)
         self.worker.finished_signal.connect(self.on_analysis_finished)
@@ -1183,6 +1507,22 @@ class VideoAudioSyncApp(QMainWindow):
 
                 self.canvas.draw_idle()
 
+    def get_dynamic_thumbnail(self, container, stream, target_time):
+        if not container or not stream:
+            return None
+        try:
+            target_pts = int(target_time / float(stream.time_base))
+            container.seek(target_pts, stream=stream)
+            for frame in container.decode(stream):
+                small_frame = frame.reformat(width=200, height=112, format="rgb24")
+                image = small_frame.to_ndarray()
+                h, w, ch = image.shape
+                qimg = QImage(image.tobytes(), w, h, w * ch, QImage.Format.Format_RGB888)
+                return QPixmap.fromImage(qimg)
+        except Exception:
+            pass
+        return None
+
     def on_canvas_hover(self, event):
         if event.inaxes is None or self.last_diff is None or self.last_t_common is None:
             self.preview_popup.hide()
@@ -1220,8 +1560,8 @@ class VideoAudioSyncApp(QMainWindow):
                 a_frame = int(t_audio * a_fps)
                 v_frame = int(t_video * v_fps)
                 
-                pix_audio = get_thumbnail(self.audio_thumbnails, t_audio)
-                pix_video = get_thumbnail(self.video_thumbnails, t_video)
+                pix_audio = self.get_dynamic_thumbnail(self.hover_container_audio, self.hover_stream_audio, max(0, t_audio))
+                pix_video = self.get_dynamic_thumbnail(self.hover_container_video, self.hover_stream_video, max(0, t_video))
                 
                 diff_sigma = (diff_val - self.baseline_diff) / (self.std_diff + 1e-6)
                 
@@ -1247,9 +1587,10 @@ class VideoAudioSyncApp(QMainWindow):
             self.log("ERROR: Please select an Output Folder first.")
             return
             
-        audio_idx, video_idx = self.get_current_indices()
-        audio_file = self.audio_files[audio_idx]
-        video_file = self.video_files[video_idx]
+        if not hasattr(self, 'matched_pairs') or not self.matched_pairs:
+            return
+            
+        audio_file, video_file = self.matched_pairs[self.current_pair_idx]
         
         base_name = os.path.splitext(os.path.basename(audio_file))[0]
         output_file = os.path.join(self.output_folder_path, f"{base_name}_synced.mkv")
