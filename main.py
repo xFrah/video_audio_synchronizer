@@ -209,10 +209,11 @@ class FFmpegWorker(QThread):
     def __init__(self, cmd):
         super().__init__()
         self.cmd = cmd
+        self.process = None
 
     def run(self):
         try:
-            process = subprocess.Popen(
+            self.process = subprocess.Popen(
                 self.cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -220,16 +221,23 @@ class FFmpegWorker(QThread):
                 bufsize=1,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
-            for line in process.stdout:
+            for line in self.process.stdout:
                 self.log_signal.emit(line.strip())
             
-            process.wait()
-            if process.returncode == 0:
+            self.process.wait()
+            if self.process.returncode == 0:
                 self.finished_signal.emit(True, "Muxing complete.")
             else:
-                self.finished_signal.emit(False, f"ffmpeg exited with code {process.returncode}")
+                self.finished_signal.emit(False, f"ffmpeg exited with code {self.process.returncode}")
         except Exception as e:
             self.finished_signal.emit(False, str(e))
+
+    def cancel(self):
+        if self.process:
+            try:
+                self.process.terminate()
+            except:
+                pass
 
 
 class AnalysisWorker(QThread):
@@ -317,10 +325,16 @@ class AnalysisWorker(QThread):
 
     def run(self):
         data1 = self.analyze_video(self.file1, "Audio Source")
-        if not data1 or self._is_cancelled: return
+        if self._is_cancelled:
+            self.error_signal.emit("Analysis stopped by user.")
+            return
+        if not data1: return
         
         data2 = self.analyze_video(self.file2, "Video Source")
-        if not data2 or self._is_cancelled: return
+        if self._is_cancelled:
+            self.error_signal.emit("Analysis stopped by user.")
+            return
+        if not data2: return
         
         self.log_signal.emit("Calculating time shift...")
         self.progress_signal.emit(0, 0, "Calculating shift...")
@@ -338,6 +352,8 @@ class AnalysisWorker(QThread):
         
         if not self._is_cancelled:
             self.finished_signal.emit(data1, data2, self.scale_factor, shift, self.mode)
+        else:
+            self.error_signal.emit("Analysis stopped by user.")
 
     def cancel(self):
         self._is_cancelled = True
@@ -545,6 +561,14 @@ class VideoAudioSyncApp(QMainWindow):
         self.btn_sync_save = QPushButton("Sync and Save")
         self.btn_sync_save.clicked.connect(self.start_sync_save)
         self.btn_sync_save.setEnabled(False)
+
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.clicked.connect(self.stop_processing)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setStyleSheet("""
+            QPushButton { background-color: #d32f2f; color: white; }
+            QPushButton:disabled { background-color: #555555; color: #aaaaaa; }
+        """)
         
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
@@ -553,6 +577,7 @@ class VideoAudioSyncApp(QMainWindow):
         
         controls_layout.addWidget(self.btn_analyze)
         controls_layout.addWidget(self.btn_sync_save)
+        controls_layout.addWidget(self.btn_stop)
         controls_layout.addWidget(self.progress_bar, stretch=1)
         controls_layout.addWidget(self.lbl_status)
         main_layout.addLayout(controls_layout)
@@ -591,6 +616,17 @@ class VideoAudioSyncApp(QMainWindow):
         scrollbar = self.log_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
+    def stop_processing(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.cancel()
+            self.log("Stopping analysis...")
+            self.btn_stop.setEnabled(False)
+            
+        if self.ffmpeg_worker and self.ffmpeg_worker.isRunning():
+            self.ffmpeg_worker.cancel()
+            self.log("Stopping ffmpeg...")
+            self.btn_stop.setEnabled(False)
+
     def on_mode_toggled(self):
         new_mode = "folder" if self.radio_folder.isChecked() else "file"
         if new_mode == self.app_mode:
@@ -610,6 +646,7 @@ class VideoAudioSyncApp(QMainWindow):
         self.last_mode = None
         self.btn_sync_save.setEnabled(False)
         self.btn_analyze.setEnabled(False)
+        self.btn_stop.setEnabled(False)
         self.figure.clear()
         self.canvas.draw()
         self.log_text.clear()
@@ -896,6 +933,7 @@ class VideoAudioSyncApp(QMainWindow):
         video_file = self.video_files[video_idx]
             
         self.btn_analyze.setEnabled(False)
+        self.btn_stop.setEnabled(True)
         self.log_text.clear()
         self.figure.clear()
         self.canvas.draw()
@@ -942,6 +980,7 @@ class VideoAudioSyncApp(QMainWindow):
     def on_analysis_error(self, msg):
         self.log(f"ERROR: {msg}")
         self.btn_analyze.setEnabled(True)
+        self.btn_stop.setEnabled(False)
         self.lbl_status.setText("Error")
         self.progress_bar.setMaximum(100)
         self.progress_bar.setValue(0)
@@ -952,6 +991,7 @@ class VideoAudioSyncApp(QMainWindow):
         self.progress_bar.setValue(100)
         self.lbl_status.setText("Finished")
         self.btn_analyze.setEnabled(True)
+        self.btn_stop.setEnabled(False)
         
         self.last_shift = shift
         self.last_scale = scale_factor
@@ -968,6 +1008,8 @@ class VideoAudioSyncApp(QMainWindow):
         t1, r1, g1, b1, h1 = data1[:5]
         t2, r2, g2, b2, h2 = data2[:5]
         
+        t1 = np.array(t1)
+        t2 = np.array(t2)
         grad1 = np.array(h1)
         grad2 = np.array(h2)
         
@@ -1014,16 +1056,18 @@ class VideoAudioSyncApp(QMainWindow):
         
         # Calculate overlap region for diff
         if overlap_start < overlap_end:
-            self.last_t_common = np.linspace(overlap_start, overlap_end, 1000)
+            valid_indices = np.where((t_ref >= overlap_start) & (t_ref <= overlap_end))[0]
+            self.last_t_common = t_ref[valid_indices]
+            
             if mode == 0:
-                interp_ref = interpolate.interp1d(t1, grad1, bounds_error=False, fill_value=0)
+                ref_vals = grad1[valid_indices]
                 interp_align = interpolate.interp1d(t_aligned, grad2, bounds_error=False, fill_value=0)
+                align_vals = interp_align(self.last_t_common)
             else:
-                interp_ref = interpolate.interp1d(t2, grad2, bounds_error=False, fill_value=0)
+                ref_vals = grad2[valid_indices]
                 interp_align = interpolate.interp1d(t_aligned, grad1, bounds_error=False, fill_value=0)
+                align_vals = interp_align(self.last_t_common)
                 
-            ref_vals = interp_ref(self.last_t_common)
-            align_vals = interp_align(self.last_t_common)
             self.last_diff = np.abs(ref_vals - align_vals)
             
             p5 = np.percentile(self.last_diff, 5)
@@ -1108,14 +1152,14 @@ class VideoAudioSyncApp(QMainWindow):
                 if self.diff_collection is not None:
                     try:
                         self.diff_collection.remove()
-                    except ValueError:
+                    except Exception:
                         pass
                     self.diff_collection = None
 
                 if hasattr(self, 'removal_collection') and self.removal_collection is not None:
                     try:
                         self.removal_collection.remove()
-                    except ValueError:
+                    except Exception:
                         pass
                     self.removal_collection = None
                         
@@ -1242,6 +1286,7 @@ class VideoAudioSyncApp(QMainWindow):
         if removal_mask is not None and np.any(removal_mask):
             cut_idx = np.argmax(removal_mask)
             t_cut = self.last_t_common[cut_idx]
+            
             if mode == 0:
                 duration_to_encode = max(0.0, t_cut - trim_audio)
             else:
@@ -1276,6 +1321,7 @@ class VideoAudioSyncApp(QMainWindow):
         
         self.btn_analyze.setEnabled(False)
         self.btn_sync_save.setEnabled(False)
+        self.btn_stop.setEnabled(True)
         self.log(f"Starting ffmpeg...")
         
         self.ffmpeg_worker = FFmpegWorker(cmd)
@@ -1287,6 +1333,7 @@ class VideoAudioSyncApp(QMainWindow):
         self.log(msg)
         self.btn_analyze.setEnabled(True)
         self.btn_sync_save.setEnabled(True)
+        self.btn_stop.setEnabled(False)
 
 
 if __name__ == "__main__":
