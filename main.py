@@ -700,10 +700,10 @@ class VideoAudioSyncApp(QMainWindow):
         self.slider_diff = QSlider(Qt.Orientation.Horizontal)
         self.slider_diff.setMinimum(0)
         self.slider_diff.setMaximum(100)
-        self.slider_diff.setValue(20)
+        self.slider_diff.setValue(28)
         self.slider_diff.setEnabled(False)
         self.slider_diff.valueChanged.connect(self.update_diff_plot)
-        self.lbl_diff_val = QLabel("1.0σ")
+        self.lbl_diff_val = QLabel("1.4σ")
         diff_layout.addWidget(self.slider_diff, stretch=1)
         diff_layout.addWidget(self.lbl_diff_val)
         lower_layout.addLayout(diff_layout)
@@ -1567,22 +1567,16 @@ class VideoAudioSyncApp(QMainWindow):
         
         shift = self.last_shift
         scale = self.last_scale
-        mode = self.last_mode
         
-        if mode == 0:
-            if shift > 0:
-                trim_audio = shift
-                trim_video = 0.0
-            else:
-                trim_audio = 0.0
-                trim_video = abs(shift) / scale
+        # shift is how much to shift audio to the right to match video
+        if shift > 0:
+            # Audio starts after video starts. Trim the video.
+            trim_video = shift / scale
+            trim_audio = 0.0
         else:
-            if shift > 0:
-                trim_video = shift
-                trim_audio = 0.0
-            else:
-                trim_video = 0.0
-                trim_audio = abs(shift) / scale
+            # Audio starts before video starts. Trim the audio.
+            trim_audio = abs(shift)
+            trim_video = 0.0
                 
         cmd = ["ffmpeg", "-y"]
         
@@ -1595,11 +1589,7 @@ class VideoAudioSyncApp(QMainWindow):
         if removal_mask is not None and np.any(removal_mask):
             cut_idx = np.argmax(removal_mask)
             t_cut = self.last_t_common[cut_idx]
-            
-            if mode == 0:
-                duration_to_encode = max(0.0, t_cut - trim_audio)
-            else:
-                duration_to_encode = max(0.0, t_cut - trim_video)
+            duration_to_encode = max(0.0, t_cut - trim_audio)
         
         if trim_audio > 0:
             cmd.extend(["-ss", f"{trim_audio:.4f}"])
@@ -1608,20 +1598,14 @@ class VideoAudioSyncApp(QMainWindow):
         if trim_video > 0:
             cmd.extend(["-ss", f"{trim_video:.4f}"])
             
-        if abs(scale - 1.0) > 0.001 and mode == 0:
+        if abs(scale - 1.0) > 0.001:
             cmd.extend(["-itsscale", f"{scale:.5f}"])
             
         cmd.extend(["-i", video_file])
         
         cmd.extend(["-map", "0:a:0", "-map", "1:v:0"])
         
-        if abs(scale - 1.0) < 0.001:
-            cmd.extend(["-c", "copy"])
-        else:
-            if mode == 0:
-                cmd.extend(["-c", "copy"])
-            else:
-                cmd.extend(["-c:v", "copy", "-c:a", "aac", "-filter:a", f"atempo={1/scale:.5f}"])
+        cmd.extend(["-c", "copy"])
                 
         if duration_to_encode is not None:
             cmd.extend(["-t", f"{duration_to_encode:.4f}"])
