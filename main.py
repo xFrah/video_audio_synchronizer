@@ -147,64 +147,37 @@ def find_time_shift(t1, y1, t2, y2, scale, log_callback=None):
     y2 = np.array(y2)
     
     t2_scaled = t2 * scale
-    fs = 1000.0
     
+    # Use exact frame pacing of the first array
+    if len(t1) > 1 and t1[-1] > t1[0]:
+        fs = len(t1) / (t1[-1] - t1[0])
+    else:
+        raise ValueError("Cannot estimate FPS: insufficient frames")
+        
     t1_uniform = np.arange(t1[0], t1[-1], 1/fs)
-    interp1 = interpolate.interp1d(t1, y1, kind='linear', fill_value="extrapolate")
+    interp1 = interpolate.interp1d(t1, y1, kind='nearest', bounds_error=False, fill_value=0)
     y1_uniform = interp1(t1_uniform)
     y1_centered = y1_uniform - np.mean(y1_uniform)
     
     t2_uniform = np.arange(t2_scaled[0], t2_scaled[-1], 1/fs)
-    interp2 = interpolate.interp1d(t2_scaled, y2, kind='linear', fill_value="extrapolate")
+    interp2 = interpolate.interp1d(t2_scaled, y2, kind='nearest', bounds_error=False, fill_value=0)
     y2_uniform = interp2(t2_uniform)
     y2_centered = y2_uniform - np.mean(y2_uniform)
     
-    corr = signal.correlate(y1_centered, y2_centered, mode='full')
-    lags = signal.correlation_lags(len(y1_centered), len(y2_centered), mode='full')
+    corr = signal.correlate(y2_centered, y1_centered, mode='full')
+    lags = signal.correlation_lags(len(y2_centered), len(y1_centered), mode='full')
     
     lag_idx = np.argmax(corr)
     lag_samples = lags[lag_idx]
-    coarse_shift = lag_samples / fs
+    shift = lag_samples / fs
     
-    msg = f"Coarse shift detected: {coarse_shift:.4f}s"
+    msg = f"Perfect frame-locked shift detected: {shift:.4f}s"
     if log_callback:
         log_callback(msg)
     else:
         print(msg)
-
-    fine_shifts = np.linspace(coarse_shift - 0.1, coarse_shift + 0.1, 201)
-    best_mse = float('inf')
-    best_shift = coarse_shift
-    f1 = interpolate.interp1d(t1, y1, kind='linear', fill_value="extrapolate")
-    
-    for s in fine_shifts:
-        t2_shifted = t2_scaled + s
-        start_t = max(t1[0], t2_shifted[0])
-        end_t = min(t1[-1], t2_shifted[-1])
         
-        if end_t <= start_t:
-            continue
-            
-        t_eval = np.arange(start_t, end_t, 0.01)
-        if len(t_eval) < 10: continue
-        
-        v1 = f1(t_eval)
-        f2 = interpolate.interp1d(t2_scaled, y2, kind='linear', fill_value="extrapolate")
-        v2 = f2(t_eval - s)
-        
-        mse = np.mean((v1 - v2)**2)
-        if mse < best_mse:
-            best_mse = mse
-            best_shift = s
-            
-    msg = f"Fine-tuned shift: {best_shift:.4f}s"
-    if log_callback:
-        log_callback(msg)
-    else:
-        print(msg)
-    return best_shift
-
-    return best_shift
+    return shift
 
 
 class FFmpegWorker(QThread):
@@ -486,10 +459,8 @@ class AnalysisWorker(QThread):
         grad1 = np.array(h1)
         grad2 = np.array(h2)
         
-        if self.mode == 0:
-            shift = find_time_shift(t1, grad1, t2, grad2, self.scale_factor, log_callback=lambda m: self.log_signal.emit(m))
-        else:
-            shift = find_time_shift(t2, grad2, t1, grad1, self.scale_factor, log_callback=lambda m: self.log_signal.emit(m))
+        # We always calculate shift with t1 (audio) as the reference, and t2 (video) as the one being shifted
+        shift = find_time_shift(t1, grad1, t2, grad2, self.scale_factor, log_callback=lambda m: self.log_signal.emit(m))
         
         if not self._is_cancelled:
             self.finished_signal.emit(self.data1, self.data2, self.scale_factor, shift, self.mode)
@@ -871,30 +842,43 @@ class VideoAudioSyncApp(QMainWindow):
                 v_fps = v_data[6]
                 y2 = np.array(h2)
                 
-                scale_factor = 1.0
-                mode = self.combo_scale.currentIndex()
-                if mode == 0:
-                    scale_factor = a_fps / v_fps if v_fps else 1.0
+                # Because we are ALWAYS scaling t2 (the video), the mathematically correct
+                # scale factor is ALWAYS (v_fps / a_fps), regardless of which one is the "dub".
+                if a_fps and v_fps:
+                    scale_factor = v_fps / a_fps
                 else:
-                    scale_factor = v_fps / a_fps if a_fps else 1.0
+                    scale_factor = 1.0
                 
                 t2_scaled = np.array(t2) * scale_factor
                 
-                fs = 200.0
+                # Calculate the exact average frame rate of the first array to use as our base grid.
+                # This ensures the "fixed frames" array maintains its exact original frame count and pacing.
+                if len(t1) > 1 and t1[-1] > t1[0]:
+                    fs = len(t1) / (t1[-1] - t1[0])
+                else:
+                    continue  # Skip if we cannot estimate FPS
+                    
                 try:
                     t1_uniform = np.arange(t1[0], t1[-1], 1/fs)
-                    interp1 = interpolate.interp1d(t1, y1, kind='linear', fill_value="extrapolate")
+                    interp1 = interpolate.interp1d(t1, y1, kind='nearest', bounds_error=False, fill_value=0)
                     y1_uniform = interp1(t1_uniform)
                     y1_centered = y1_uniform - np.mean(y1_uniform)
                     
                     t2_uniform = np.arange(t2_scaled[0], t2_scaled[-1], 1/fs)
-                    interp2 = interpolate.interp1d(t2_scaled, y2, kind='linear', fill_value="extrapolate")
+                    interp2 = interpolate.interp1d(t2_scaled, y2, kind='nearest', bounds_error=False, fill_value=0)
                     y2_uniform = interp2(t2_uniform)
                     y2_centered = y2_uniform - np.mean(y2_uniform)
                     
-                    corr = signal.correlate(y1_centered, y2_centered, mode='valid')
+                    if len(y1_centered) <= len(y2_centered):
+                        y_short, y_long = y1_centered, y2_centered
+                    else:
+                        y_short, y_long = y2_centered, y1_centered
+                        
+                    corr = signal.correlate(y_long, y_short, mode='full')
                     if len(corr) == 0:
                         continue
+                        
+                    # The user wants raw maximum overlap score so longer overlaps naturally score higher.
                     peak = np.max(corr)
                     
                     if peak > best_match_peak:
@@ -1272,10 +1256,10 @@ class VideoAudioSyncApp(QMainWindow):
         self.progress_bar.setValue(0)
         
         mode = self.combo_scale.currentIndex()
-        if mode == 0:
-            scale_factor = self.audio_fps / self.video_fps if self.video_fps else 1.0
+        if self.audio_fps and self.video_fps:
+            scale_factor = self.video_fps / self.audio_fps
         else:
-            scale_factor = self.video_fps / self.audio_fps if self.audio_fps else 1.0
+            scale_factor = 1.0
             
         self.lbl_status.setText("Analyzing...")
         self.log(f"Using scale factor: {scale_factor:.5f}")
@@ -1348,18 +1332,13 @@ class VideoAudioSyncApp(QMainWindow):
             spine.set_edgecolor('gray')
         
         # Plot Aligned Color Balance
-        if mode == 0:
-            ax3.plot(t1, grad1, color='white', label='Audio Source Color Tint', linewidth=2)
-            t_aligned = np.array(t2) * scale_factor + shift
-            ax3.plot(t_aligned, grad2, color='cyan', label=f'Video Source (x{scale_factor:.3f} + {shift:.2f}s)', linewidth=2, linestyle='--')
-            ax3.set_xlabel('Time (Audio Source Timebase)')
-            t_ref = t1
-        else:
-            ax3.plot(t2, grad2, color='white', label='Video Source Color Tint', linewidth=2)
-            t_aligned = np.array(t1) * scale_factor + shift
-            ax3.plot(t_aligned, grad1, color='cyan', label=f'Audio Source (x{scale_factor:.3f} + {shift:.2f}s)', linewidth=2, linestyle='--')
-            ax3.set_xlabel('Time (Video Source Timebase)')
-            t_ref = t2
+        ax3.plot(t1, grad1, color='white', label='Audio Source Color Tint', linewidth=2)
+        # Shift must be SUBTRACTED because if audio (t1) needs to be shifted RIGHT (+shift) to match video (t2),
+        # then bringing video (t2) to match audio (t1) at 0 requires shifting video LEFT (-shift).
+        t_aligned = np.array(t2) * scale_factor - shift
+        ax3.plot(t_aligned, grad2, color='cyan', label=f'Video Source (x{scale_factor:.3f} {-shift:+.2f}s)', linewidth=2, linestyle='--')
+        ax3.set_xlabel('Time (Audio Source Timebase)')
+        t_ref = t1
             
         overall_start = min(t_ref[0], t_aligned[0])
         overall_end = max(t_ref[-1], t_aligned[-1])
@@ -1383,14 +1362,9 @@ class VideoAudioSyncApp(QMainWindow):
             valid_indices = np.where((t_ref >= overlap_start) & (t_ref <= overlap_end))[0]
             self.last_t_common = t_ref[valid_indices]
             
-            if mode == 0:
-                ref_vals = grad1[valid_indices]
-                interp_align = interpolate.interp1d(t_aligned, grad2, bounds_error=False, fill_value=0)
-                align_vals = interp_align(self.last_t_common)
-            else:
-                ref_vals = grad2[valid_indices]
-                interp_align = interpolate.interp1d(t_aligned, grad1, bounds_error=False, fill_value=0)
-                align_vals = interp_align(self.last_t_common)
+            ref_vals = grad1[valid_indices]
+            interp_align = interpolate.interp1d(t_aligned, grad2, bounds_error=False, fill_value=0)
+            align_vals = interp_align(self.last_t_common)
                 
             self.last_diff = np.abs(ref_vals - align_vals)
             
@@ -1550,12 +1524,8 @@ class VideoAudioSyncApp(QMainWindow):
                 scale = self.last_scale or 1.0
                 mode = self.last_mode or 0
                 
-                if mode == 0:
-                    t_audio = t_hover
-                    t_video = (t_hover - shift) / scale
-                else:
-                    t_video = t_hover
-                    t_audio = (t_hover - shift) / scale
+                t_audio = t_hover
+                t_video = (t_hover + shift) / scale
                     
                 a_frame = int(t_audio * a_fps)
                 v_frame = int(t_video * v_fps)
