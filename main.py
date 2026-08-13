@@ -1172,11 +1172,11 @@ class VideoAudioSyncApp(QMainWindow):
                         label='Diff > Threshold'
                     )
 
-                removal_mask = self.get_removal_mask(threshold, min_density=0.50)
-                if removal_mask is not None and np.any(removal_mask):
+                self.last_removal_mask = self.get_removal_mask(threshold, min_density=0.50)
+                if self.last_removal_mask is not None and np.any(self.last_removal_mask):
                     self.removal_collection = ax3.fill_between(
                         self.last_t_common, 0, 0.04,
-                        where=removal_mask,
+                        where=self.last_removal_mask,
                         color='red', alpha=1.0, zorder=15, transform=ax3.get_xaxis_transform(),
                         label='To Be Removed'
                     )
@@ -1201,8 +1201,7 @@ class VideoAudioSyncApp(QMainWindow):
             sigma_multiplier = self.slider_diff.value() / 20.0
             threshold = self.baseline_diff + (sigma_multiplier * self.std_diff)
             
-            mask = self.get_diff_mask(threshold)
-            if mask is not None and mask[idx]:
+            if True:
                 time_str = format_time(t_hover)
                 a_fps = self.audio_fps or 25.0
                 v_fps = self.video_fps or 25.0
@@ -1226,8 +1225,7 @@ class VideoAudioSyncApp(QMainWindow):
                 
                 diff_sigma = (diff_val - self.baseline_diff) / (self.std_diff + 1e-6)
                 
-                removal_mask = self.get_removal_mask(threshold, min_density=0.50)
-                is_removal = removal_mask is not None and removal_mask[idx]
+                is_removal = hasattr(self, 'last_removal_mask') and self.last_removal_mask is not None and self.last_removal_mask[idx]
                 status_icon = "   |   🛑 TO BE REMOVED" if is_removal else ""
 
                 header_text = f"⏱ Time: {time_str} ({t_hover:.2f}s)   |   Diff: {diff_val:.3f} ({diff_sigma:.1f}σ){status_icon}"
